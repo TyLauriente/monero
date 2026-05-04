@@ -404,6 +404,17 @@ struct WalletListener
     }
 
     /**
+     * @brief called by device when CodeEntry pairing requires the host
+     *        to prompt the user for the 6-digit code currently displayed
+     *        on the device.  Used during the THP first-pairing flow on
+     *        Trezor Safe 7.  Return the user-entered code as ASCII
+     *        digits, or an empty string to abort pairing.
+     */
+    virtual optional<std::string> onDevicePairingCodeRequest() {
+        return optional<std::string>();
+    }
+
+    /**
      * @brief Signalizes device operation progress
      */
     virtual void onDeviceProgress(const DeviceProgress & event) { (void)event; };

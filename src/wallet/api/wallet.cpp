@@ -290,6 +290,17 @@ struct Wallet2CallbackImpl : public tools::i_wallet2_callback
       return boost::none;
     }
 
+    virtual std::string on_device_pairing_code_request() override
+    {
+      if (m_listener) {
+        auto code = m_listener->onDevicePairingCodeRequest();
+        if (code) {
+          return *code;
+        }
+      }
+      return {};
+    }
+
     virtual void on_device_progress(const hw::device_progress & event)
     {
       if (m_listener) {
