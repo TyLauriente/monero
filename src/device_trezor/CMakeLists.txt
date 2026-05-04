@@ -45,6 +45,11 @@ set(trezor_headers
         trezor/messages_map.hpp
         trezor/protocol.hpp
         trezor/transport.hpp
+        trezor/thp/crc32.hpp
+        trezor/thp/framing.hpp
+        trezor/thp/channel.hpp
+        trezor/thp/noise.hpp
+        trezor/thp/protocol_v2.hpp
         device_trezor_base.hpp
         device_trezor.hpp
         trezor.hpp
@@ -55,6 +60,10 @@ set(trezor_sources
         trezor/messages_map.cpp
         trezor/protocol.cpp
         trezor/transport.cpp
+        trezor/thp/framing.cpp
+        trezor/thp/channel.cpp
+        trezor/thp/noise.cpp
+        trezor/thp/protocol_v2.cpp
         device_trezor_base.cpp
         device_trezor.cpp
         ${TREZOR_PROTOB_CPP}
@@ -97,6 +106,7 @@ if(DEVICE_TREZOR_READY)
             ${Protobuf_LIBRARY}
             ${TREZOR_LIBUSB_LIBRARIES}
             PRIVATE
+            ${OPENSSL_LIBRARIES}
             ${EXTRA_LIBRARIES}
             ${TREZOR_EXTRA_LIBRARIES})
 

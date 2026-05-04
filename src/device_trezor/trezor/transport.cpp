@@ -32,6 +32,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <boost/endian/conversion.hpp>
 #include <boost/asio/ip/udp.hpp>
@@ -40,6 +41,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include "common/apply_permutation.h"
 #include "transport.hpp"
+#include "thp/protocol_v2.hpp"
 #include "messages/messages-common.pb.h"
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -114,6 +116,15 @@ namespace trezor{
     uint16_t id_product;
   } trezor_usb_desc_t;
 
+  // trezor_type values:
+  //   1 - Trezor One (legacy v1 protocol)
+  //   2 - Trezor Model T / Safe 3 / Safe 5 / Safe 7 (legacy v1 OR THP, see note)
+  //   3 - Trezor Model T bootloader
+  //
+  // Note: the Trezor Safe 7 ships with the same USB VID/PID as the Model T
+  // (0x1209:0x53C1) but exclusively speaks the Trezor Host Protocol v2 (THP).
+  // The wire-format protocol is therefore selected at runtime via probe (or
+  // by setting TREZOR_FORCE_THP=1 in the environment); see thp/protocol_v2.hpp.
   static trezor_usb_desc_t TREZOR_DESC_T1 = {1, 0x534C, 0x0001};
   static trezor_usb_desc_t TREZOR_DESC_T2 = {2, 0x1209, 0x53C1};
   static trezor_usb_desc_t TREZOR_DESC_T2_BL = {3, 0x1209, 0x53C0};
@@ -123,6 +134,14 @@ namespace trezor{
       TREZOR_DESC_T2,
       TREZOR_DESC_T2_BL,
   };
+
+  // Returns true when the user has explicitly requested THP via environment
+  // variable. Real wire-protocol auto-detection requires a Safe 7 to test
+  // against (see src/device_trezor/trezor/thp/README.md) and is left as TODO.
+  static bool force_thp_protocol() {
+    const char *v = std::getenv("TREZOR_FORCE_THP");
+    return v && v[0] && v[0] != '0';
+  }
 
   static size_t TREZOR_DESCS_LEN = sizeof(TREZOR_DESCS)/sizeof(TREZOR_DESCS[0]);
 
@@ -553,7 +572,13 @@ namespace trezor{
       throw std::invalid_argument("Local endpoint allowed only");
     }
 
-    m_proto = proto ? proto.get() : std::make_shared<ProtocolV1>();
+    if (proto) {
+      m_proto = proto.get();
+    } else if (force_thp_protocol()) {
+      m_proto = std::make_shared<thp::ProtocolV2>();
+    } else {
+      m_proto = std::make_shared<ProtocolV1>();
+    }
   }
 
   std::string UdpTransport::get_path() const {
@@ -873,7 +898,13 @@ namespace trezor{
       this->m_usb_device_desc.reset(desc);
     }
 
-    m_proto = proto ? proto.get() : std::make_shared<ProtocolV1>();
+    if (proto) {
+      m_proto = proto.get();
+    } else if (force_thp_protocol()) {
+      m_proto = std::make_shared<thp::ProtocolV2>();
+    } else {
+      m_proto = std::make_shared<ProtocolV1>();
+    }
 
 #ifdef WITH_TREZOR_DEBUGGING
     m_debug_mode = false;
