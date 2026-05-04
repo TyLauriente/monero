@@ -39,7 +39,7 @@ namespace hw { namespace trezor { namespace thp {
   static constexpr size_t NONCE_BYTES = 8;
   static constexpr size_t ALLOC_RESPONSE_FIXED_BYTES = NONCE_BYTES + sizeof(uint16_t);
 
-  AllocatedChannel allocate_channel(Transport &transport)
+  AllocatedChannel allocate_channel(Transport &transport, unsigned int timeout_ms)
   {
     // 1. Build ChannelAllocationRequest body: random 8-byte nonce.
     AllocatedChannel out;
@@ -57,7 +57,9 @@ namespace hw { namespace trezor { namespace thp {
     FrameAssembler asm_;
     uint8_t chunk[USB_CHUNK_SIZE];
     while (true) {
-      const size_t got = transport.read_chunk(chunk, sizeof(chunk));
+      const size_t got = (timeout_ms != 0)
+          ? transport.read_chunk(chunk, sizeof(chunk), timeout_ms)
+          : transport.read_chunk(chunk, sizeof(chunk));
       if (got != USB_CHUNK_SIZE) {
         throw exc::CommunicationException("THP: short chunk during channel allocation");
       }

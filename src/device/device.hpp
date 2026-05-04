@@ -81,6 +81,16 @@ namespace hw {
         virtual boost::optional<epee::wipeable_string> on_pin_request() { return boost::none; }
         virtual boost::optional<epee::wipeable_string> on_passphrase_request(bool & on_device) { on_device = true; return boost::none; }
         virtual void on_progress(const device_progress& event) {}
+
+        // Called once during the THP CodeEntry pairing flow used by the
+        // Trezor Safe 7 (and any future device that drops the legacy v1
+        // protocol).  The host/GUI is expected to render a modal asking
+        // the user to type the 6-digit code currently shown on the
+        // Trezor's screen.  Return the user-entered code as an ASCII
+        // string of digits; throw or return an empty string to abort
+        // pairing (which will tear down the channel).
+        virtual std::string on_pairing_code_request() { return {}; }
+
         virtual ~i_device_callback() = default;
     };
 

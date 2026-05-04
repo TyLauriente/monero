@@ -156,9 +156,24 @@ namespace trezor {
     virtual void write(const google::protobuf::Message & req) =0;
     virtual void read(std::shared_ptr<google::protobuf::Message> & msg, messages::MessageType * msg_type=nullptr) =0;
     virtual std::shared_ptr<Transport> find_debug() { return nullptr; };
+    // Inner Protocol object (ProtocolV1, ProtocolV2 or
+    // ProtocolAutoDetect).  Used by the device-glue layer to configure
+    // THP-specific options (pairing prompt, persistent store path)
+    // before the first open() call.  Returns nullptr for transports
+    // that don't carry a protocol.
+    virtual std::shared_ptr<Protocol> protocol() const { return nullptr; }
 
     virtual void write_chunk(const void * buff, size_t size) { };
     virtual size_t read_chunk(void * buff, size_t size) { return 0; };
+    // Same as read_chunk but with a soft timeout in milliseconds.  On
+    // timeout the implementation throws exc::TimeoutException.  The
+    // default falls back to the unbounded read_chunk and is used by
+    // transports that don't support a configurable read timeout (they
+    // will simply block — acceptable for the THP probe iff the device
+    // actually responds, which the THP-only Safe 7 always does).
+    virtual size_t read_chunk(void * buff, size_t size, unsigned int /*timeout_ms*/) {
+      return read_chunk(buff, size);
+    }
     virtual std::ostream& dump(std::ostream& o) const { return o << "Transport<>"; }
   protected:
     long m_open_counter;
@@ -228,6 +243,9 @@ namespace trezor {
 
     void write_chunk(const void * buff, size_t size) override;
     size_t read_chunk(void * buff, size_t size) override;
+    size_t read_chunk(void * buff, size_t size, unsigned int timeout_ms) override;
+
+    std::shared_ptr<Protocol> protocol() const override { return m_proto; }
 
     std::ostream& dump(std::ostream& o) const override;
 
@@ -276,6 +294,9 @@ namespace trezor {
 
     void write_chunk(const void * buff, size_t size) override;
     size_t read_chunk(void * buff, size_t size) override;
+    size_t read_chunk(void * buff, size_t size, unsigned int timeout_ms) override;
+
+    std::shared_ptr<Protocol> protocol() const override { return m_proto; }
 
     std::ostream& dump(std::ostream& o) const override;
 

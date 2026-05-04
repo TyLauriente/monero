@@ -52,8 +52,14 @@ namespace hw { namespace trezor { namespace thp {
   // device to reply with a CTRL_CHANNEL_ALLOC_RESPONSE echoing the nonce
   // and assigning a CID.
   //
+  // `timeout_ms` is the per-chunk read deadline used to wait for the
+  // device's response.  Set this to a short value (e.g. 3000) when used
+  // as part of the v1/v2 protocol probe so a non-THP device's silence
+  // doesn't hang the caller.  Default 0 keeps the transport's default
+  // (unbounded for USB, ~10s for UDP).
+  //
   // Reads/writes are performed via Transport::write_chunk / read_chunk.
-  AllocatedChannel allocate_channel(Transport &transport);
+  AllocatedChannel allocate_channel(Transport &transport, unsigned int timeout_ms = 0);
 
 }}}
 

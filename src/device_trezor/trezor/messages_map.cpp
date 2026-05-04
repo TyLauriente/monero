@@ -32,6 +32,7 @@
 #include "messages/messages-common.pb.h"
 #include "messages/messages-management.pb.h"
 #include "messages/messages-monero.pb.h"
+#include "messages/messages-thp.pb.h"
 
 #ifdef WITH_TREZOR_DEBUGGING
 #include "messages/messages-debug.pb.h"
@@ -52,7 +53,8 @@ namespace trezor
 #ifdef WITH_TREZOR_DEBUGGING
       "hw.trezor.messages.debug.",
 #endif
-      "hw.trezor.messages.monero."
+      "hw.trezor.messages.monero.",
+      "hw.trezor.messages.thp."
   };
 
   google::protobuf::Message * MessageMapper::get_message(int wire_number) {
@@ -60,12 +62,21 @@ namespace trezor
   }
 
   google::protobuf::Message * MessageMapper::get_message(messages::MessageType wire_number) {
-    const string &messageTypeName = hw::trezor::messages::MessageType_Name(wire_number);
-    if (messageTypeName.empty()) {
-      throw exc::EncodingException(std::string("Message descriptor not found: ") + std::to_string(wire_number));
+    string messageTypeName = hw::trezor::messages::MessageType_Name(wire_number);
+    string messageName;
+    if (!messageTypeName.empty()) {
+      messageName = messageTypeName.substr(strlen(TYPE_PREFIX));
+    } else {
+      // THP messages live in a separate enum (ThpMessageType) with its own
+      // wire numbers in the 1008..1041 range. Fall back to it before
+      // declaring the wire number unknown.
+      const string &thpName = hw::trezor::messages::thp::ThpMessageType_Name(
+          static_cast<hw::trezor::messages::thp::ThpMessageType>(wire_number));
+      if (thpName.empty()) {
+        throw exc::EncodingException(std::string("Message descriptor not found: ") + std::to_string(wire_number));
+      }
+      messageName = thpName.substr(strlen("ThpMessageType_"));
     }
-
-    string messageName = messageTypeName.substr(strlen(TYPE_PREFIX));
     return MessageMapper::get_message(messageName);
   }
 
@@ -74,6 +85,7 @@ namespace trezor
     hw::trezor::messages::common::Success::default_instance();
     hw::trezor::messages::management::Cancel::default_instance();
     hw::trezor::messages::monero::MoneroGetAddress::default_instance();
+    hw::trezor::messages::thp::ThpPairingRequest::default_instance();
 
 #ifdef WITH_TREZOR_DEBUGGING
     hw::trezor::messages::debug::DebugLinkDecision::default_instance();
@@ -125,11 +137,21 @@ namespace trezor
 
     messages::MessageType res;
     bool r = hw::trezor::messages::MessageType_Parse(enumMessageName, &res);
-    if (!r){
-      throw exc::EncodingException(std::string("Message ") + msg_name + " not found");
+    if (r){
+      return res;
     }
 
-    return res;
+    // THP-specific message types live in ThpMessageType (1008..1041). The
+    // wire numbers are unique across the two enums (THP reserves 0..999 and
+    // 1100..max for the main MessageType enum), so we can return them as
+    // messages::MessageType safely.
+    string thpEnumName = std::string("ThpMessageType_") + msg_name;
+    hw::trezor::messages::thp::ThpMessageType thp_res;
+    if (hw::trezor::messages::thp::ThpMessageType_Parse(thpEnumName, &thp_res)) {
+      return static_cast<messages::MessageType>(thp_res);
+    }
+
+    throw exc::EncodingException(std::string("Message ") + msg_name + " not found");
   }
 
 #ifdef PROTOBUF_HAS_ABSEIL

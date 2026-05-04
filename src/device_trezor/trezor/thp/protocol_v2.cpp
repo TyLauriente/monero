@@ -75,6 +75,12 @@ namespace hw { namespace trezor { namespace thp {
     m_known_devices = std::move(known);
   }
 
+  void ProtocolV2::adopt_allocation(const AllocatedChannel &allocation)
+  {
+    m_channel         = allocation;
+    m_have_allocation = true;
+  }
+
   void ProtocolV2::session_begin(Transport &transport) {
     if (m_session_open) {
       return;
@@ -90,8 +96,11 @@ namespace hw { namespace trezor { namespace thp {
       m_have_host_static = true;
     }
 
-    // 1. Channel allocation on the broadcast CID.
-    m_channel = allocate_channel(transport);
+    // 1. Channel allocation on the broadcast CID — unless the auto-detect
+    //    layer already did it as part of the probe.
+    if (!m_have_allocation) {
+      m_channel = allocate_channel(transport);
+    }
     MDEBUG("THP: allocated channel " << m_channel.channel_id);
 
     // 2. Wire device properties + persisted credentials into the handshake.

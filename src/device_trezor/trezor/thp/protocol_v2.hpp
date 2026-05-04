@@ -65,6 +65,17 @@ namespace hw { namespace trezor { namespace thp {
     // Provide previously-paired devices. May be empty for first-time pairing.
     void set_known_devices(std::vector<KnownDevice> known);
 
+    // Skip the channel allocation step on session_begin; reuse the
+    // allocation that the probe already obtained.  Used by
+    // ProtocolAutoDetect; callers that go straight to ProtocolV2 should
+    // not need this.
+    void adopt_allocation(const AllocatedChannel &allocation);
+
+    // Read-only access to the host static keypair currently in use
+    // (either the value passed to set_host_static_key or, in TOFU mode,
+    // a freshly-generated one).
+    const HostStaticKey &host_static() const { return m_host_static; }
+
     void session_begin(Transport &transport) override;
     void session_end  (Transport &transport) override;
 
@@ -94,6 +105,7 @@ namespace hw { namespace trezor { namespace thp {
     Frame recv_frame(Transport &transport);
 
     AllocatedChannel  m_channel;
+    bool              m_have_allocation = false;
     NoiseXxInitiator  m_handshake;
     HostStaticKey     m_host_static{};
     bool              m_have_host_static = false;

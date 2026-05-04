@@ -41,6 +41,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include "common/apply_permutation.h"
 #include "transport.hpp"
+#include "thp/auto_detect.hpp"
 #include "thp/protocol_v2.hpp"
 #include "messages/messages-common.pb.h"
 
@@ -135,11 +136,20 @@ namespace trezor{
       TREZOR_DESC_T2_BL,
   };
 
-  // Returns true when the user has explicitly requested THP via environment
-  // variable. Real wire-protocol auto-detection requires a Safe 7 to test
-  // against (see src/device_trezor/trezor/thp/README.md) and is left as TODO.
+  // Returns true when the user has explicitly forced ProtocolV2/THP only
+  // (no probe).  This is rarely needed in practice — ProtocolAutoDetect
+  // probes the device and selects the right protocol — but we keep the
+  // env var as an escape hatch for diagnostics.
   static bool force_thp_protocol() {
     const char *v = std::getenv("TREZOR_FORCE_THP");
+    return v && v[0] && v[0] != '0';
+  }
+  // Returns true when the user has explicitly forced ProtocolV1 only
+  // (skip the probe).  Useful when the THP probe causes problems on a
+  // particular USB stack — set TREZOR_FORCE_V1=1 to fall straight to
+  // legacy framing.
+  static bool force_v1_protocol() {
+    const char *v = std::getenv("TREZOR_FORCE_V1");
     return v && v[0] && v[0] != '0';
   }
 
@@ -576,8 +586,10 @@ namespace trezor{
       m_proto = proto.get();
     } else if (force_thp_protocol()) {
       m_proto = std::make_shared<thp::ProtocolV2>();
-    } else {
+    } else if (force_v1_protocol()) {
       m_proto = std::make_shared<ProtocolV1>();
+    } else {
+      m_proto = std::make_shared<thp::ProtocolAutoDetect>();
     }
   }
 
@@ -693,6 +705,10 @@ namespace trezor{
   }
 
   size_t UdpTransport::read_chunk(void * buff, size_t size){
+    return read_chunk(buff, size, 10000 /* default 10s timeout */);
+  }
+
+  size_t UdpTransport::read_chunk(void * buff, size_t size, unsigned int timeout_ms){
     require_socket();
     if (size < 64){
       throw std::invalid_argument("Buffer too small");
@@ -702,9 +718,10 @@ namespace trezor{
     while(true) {
       try {
         boost::system::error_code ec;
-        len = receive(buff, size, &ec, true);
+        len = receive(buff, size, &ec, true,
+                      boost::asio::steady_timer::duration(std::chrono::milliseconds(timeout_ms)));
         if (ec == boost::asio::error::operation_aborted) {
-          continue;
+          throw exc::TimeoutException("UdpTransport read_chunk timeout");
         } else if (ec) {
           throw exc::CommunicationException(std::string("Comm error: ") + ec.message());
         }
@@ -902,8 +919,10 @@ namespace trezor{
       m_proto = proto.get();
     } else if (force_thp_protocol()) {
       m_proto = std::make_shared<thp::ProtocolV2>();
-    } else {
+    } else if (force_v1_protocol()) {
       m_proto = std::make_shared<ProtocolV1>();
+    } else {
+      m_proto = std::make_shared<thp::ProtocolAutoDetect>();
     }
 
 #ifdef WITH_TREZOR_DEBUGGING
@@ -1164,12 +1183,21 @@ namespace trezor{
   };
 
   size_t WebUsbTransport::read_chunk(void * buff, size_t size) {
+    return read_chunk(buff, size, 0 /* infinite */);
+  }
+
+  size_t WebUsbTransport::read_chunk(void * buff, size_t size, unsigned int timeout_ms) {
     require_connected();
     unsigned char endpoint = get_endpoint();
     endpoint = (endpoint & ~LIBUSB_ENDPOINT_DIR_MASK) | LIBUSB_ENDPOINT_IN;
 
     int transferred = 0;
-    int r = libusb_interrupt_transfer(m_usb_device_handle, endpoint, (unsigned char*)buff, (int)size, &transferred, 0);
+    int r = libusb_interrupt_transfer(m_usb_device_handle, endpoint, (unsigned char*)buff,
+                                      (int)size, &transferred,
+                                      timeout_ms /* 0 == no timeout */);
+    if (r == LIBUSB_ERROR_TIMEOUT) {
+      throw exc::TimeoutException("WebUsbTransport read_chunk timeout");
+    }
     CHECK_AND_ASSERT_THROW_MES(r == 0, "Unable to transfer, r: " << r);
     if (transferred != (int)size){
       throw exc::CommunicationException("Could not read the chunk");

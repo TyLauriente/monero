@@ -29,9 +29,13 @@
 
 #include "device_trezor_base.hpp"
 #include "memwipe.h"
+#include "common/util.h"
+#include "trezor/thp/auto_detect.hpp"
+#include "trezor/thp/store.hpp"
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/regex.hpp>
 
 namespace hw {
@@ -139,6 +143,28 @@ namespace trezor {
         if (!m_transport) {
           MERROR("No matching Trezor device found. Device specifier: \"" + this->name + "\"");
           return false;
+        }
+
+        // Configure THP auto-detect (if the transport carries a
+        // ProtocolAutoDetect) so that an attached Trezor Safe 7 can
+        // run its CodeEntry pairing FSM and have the credential
+        // persisted to disk for next time.  No-op for transports that
+        // were constructed with an explicit V1/V2 protocol or for
+        // BridgeTransport which talks to the device via trezord.
+        if (auto p = m_transport->protocol()) {
+          if (auto autod = std::dynamic_pointer_cast<thp::ProtocolAutoDetect>(p)) {
+            thp::ProtocolConfig cfg;
+            cfg.host_name      = "Monero Wallet";
+            cfg.app_name       = "monero-wallet";
+            cfg.store_path     = thp::ThpStore::default_path(tools::get_default_data_dir());
+            // Capture `this` (not the current m_callback value) so the
+            // GUI can install its callback after connect() if needed.
+            cfg.pairing_prompt = [this]() -> std::string {
+              if (!this->m_callback) return std::string();
+              return this->m_callback->on_pairing_code_request();
+            };
+            autod->configure(cfg);
+          }
         }
 
         m_transport->open();
