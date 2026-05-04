@@ -45,6 +45,7 @@ set(unit_tests_sources
   cryptonote_format_utils.cpp
   decompose_amount_into_digits.cpp
   device.cpp
+  device_trezor_thp.cpp
   difficulty.cpp
   dns_resolver.cpp
   epee_boosted_tcp_server.cpp
@@ -120,6 +121,7 @@ target_link_libraries(unit_tests
     daemon_messages
     daemon_rpc_server
     blockchain_db
+    device_trezor
     lmdb_lib
     rpc
     net
