@@ -31,6 +31,7 @@
 
 #include "../transport.hpp"
 #include "channel.hpp"
+#include "framing.hpp"
 #include "noise.hpp"
 
 #include <memory>
@@ -91,6 +92,7 @@ namespace hw { namespace trezor { namespace thp {
     const NoisePubKey            &trezor_masked_static()   const { return m_handshake.trezor_masked_static_pubkey(); }
     uint8_t                       trezor_state()           const { return m_handshake.trezor_state(); }
     bool                          is_known_device()        const { return m_handshake.is_known_device(); }
+    const NoiseHash              &handshake_hash()         const { return m_handshake.keys().handshake_hash; }
 
   private:
     // Send a transport-layer frame and (for sequence-bearing frames) wait

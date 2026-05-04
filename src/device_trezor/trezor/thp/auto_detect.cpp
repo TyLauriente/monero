@@ -31,8 +31,8 @@
 #include "store.hpp"
 #include "../exceptions.hpp"
 #include "../messages_map.hpp"
-#include "messages/messages-thp.pb.h"
-#include "messages/messages-common.pb.h"
+#include "../messages/messages-thp.pb.h"
+#include "../messages/messages-common.pb.h"
 
 #include <cstring>
 
@@ -203,7 +203,7 @@ namespace hw { namespace trezor { namespace thp {
     m_v2->write(transport, sel);
 
     // 3. Receive ThpCodeEntryCommitment, send ThpCodeEntryChallenge.
-    CodeEntryPairing pairing(m_v2->keys().handshake_hash);
+    CodeEntryPairing pairing(m_v2->handshake_hash());
     while (true) {
       m_v2->read(transport, msg, &mt);
       if (std::dynamic_pointer_cast<messages::common::ButtonRequest>(msg)) {
