@@ -260,6 +260,16 @@ namespace hw { namespace trezor { namespace thp {
   CodeEntryPairing::CodeEntryPairing(const NoiseHash &handshake_hash)
     : m_h(handshake_hash) {}
 
+  CodeEntryPairing::~CodeEntryPairing()
+  {
+    sodium_memzero(m_cpace_host_priv.data(), m_cpace_host_priv.size());
+    sodium_memzero(m_shared_secret.data(),   m_shared_secret.size());
+    if (!m_code.empty()) {
+      sodium_memzero(&m_code[0], m_code.size());
+      m_code.clear();
+    }
+  }
+
   std::vector<uint8_t> CodeEntryPairing::build_pairing_request(const std::string &host_name,
                                                                const std::string &app_name)
   {
@@ -314,11 +324,27 @@ namespace hw { namespace trezor { namespace thp {
     if (code.empty()) {
       throw exc::ProtocolException("THP pairing: empty code");
     }
-    m_code = code;
+    if (code.size() > 6) {
+      throw exc::ProtocolException("THP pairing: code longer than 6 digits");
+    }
+    for (char c : code) {
+      if (c < '0' || c > '9') {
+        throw exc::ProtocolException("THP pairing: code must be ASCII digits");
+      }
+    }
+    // Per spec the device hashes f"{code:06}" — i.e. exactly 6 ASCII
+    // digits, zero-padded on the left. The user may type "1234" but the
+    // device computed against "001234"; without the pad CPace tags
+    // mismatch and pairing silently fails for ~10% of generated codes.
+    std::string padded = code;
+    if (padded.size() < 6) {
+      padded.insert(0, 6 - padded.size(), '0');
+    }
+    m_code = padded;
 
     // generator = ELLIGATOR2(SHA-512(prefix || code || padding || h || 0x00)[:32])
     uint8_t generator[32];
-    cpace_derive_generator(code, m_h, generator);
+    cpace_derive_generator(padded, m_h, generator);
 
     // cpace_host_private_key = random 32 bytes
     randombytes_buf(m_cpace_host_priv.data(), m_cpace_host_priv.size());
@@ -341,8 +367,9 @@ namespace hw { namespace trezor { namespace thp {
     crypto::x25519(priv, trezor_pub, shared);
     std::memcpy(m_shared_secret.data(), shared.data(), 32);
 
-    sodium_memzero(generator,    sizeof(generator));
-    sodium_memzero(priv.data(),  priv.size());
+    sodium_memzero(generator,     sizeof(generator));
+    sodium_memzero(priv.data(),   priv.size());
+    sodium_memzero(shared.data(), shared.size());
 
     // tag = SHA-256(shared_secret)
     uint8_t tag[crypto_hash_sha256_BYTES];

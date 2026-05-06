@@ -76,6 +76,10 @@ namespace hw { namespace trezor { namespace thp {
     // device assigned (always 0x02 / CodeEntry for this driver).
     explicit CodeEntryPairing(const NoiseHash &handshake_hash);
 
+    // Wipe all sensitive members on destruction (CPace private key,
+    // shared secret, code).
+    ~CodeEntryPairing();
+
     // HP0 -> HP1: build the ThpPairingRequest payload (host_name, app_name).
     // The two strings are written into a protobuf-encoded body.
     static std::vector<uint8_t> build_pairing_request(const std::string &host_name,
