@@ -30,14 +30,37 @@
 #include "framing.hpp"
 #include "../exceptions.hpp"
 #include "../transport.hpp"
+#include "misc_log_ex.h"
 
 #include <sodium/randombytes.h>
 #include <cstring>
+
+#undef MONERO_DEFAULT_LOG_CATEGORY
+#define MONERO_DEFAULT_LOG_CATEGORY "device.trezor.thp"
 
 namespace hw { namespace trezor { namespace thp {
 
   static constexpr size_t NONCE_BYTES = 8;
   static constexpr size_t ALLOC_RESPONSE_FIXED_BYTES = NONCE_BYTES + sizeof(uint16_t);
+
+  // Read one full frame off the bus. Throws TimeoutException if no data arrives
+  // (so allocate_channel can let the caller fall through to V1 detection).
+  static Frame read_one_frame(Transport &transport, unsigned int timeout_ms)
+  {
+    FrameAssembler asm_;
+    uint8_t chunk[USB_CHUNK_SIZE];
+    while (true) {
+      const size_t got = (timeout_ms != 0)
+          ? transport.read_chunk(chunk, sizeof(chunk), timeout_ms)
+          : transport.read_chunk(chunk, sizeof(chunk));
+      if (got != USB_CHUNK_SIZE) {
+        throw exc::CommunicationException("THP: short chunk during channel allocation");
+      }
+      if (asm_.feed_chunk(chunk, USB_CHUNK_SIZE)) {
+        return asm_.take();
+      }
+    }
+  }
 
   AllocatedChannel allocate_channel(Transport &transport, unsigned int timeout_ms)
   {
@@ -53,48 +76,49 @@ namespace hw { namespace trezor { namespace thp {
       transport.write_chunk(wire.data() + off, USB_CHUNK_SIZE);
     }
 
-    // 3. Read chunks back and reassemble until we have a full response.
-    FrameAssembler asm_;
-    uint8_t chunk[USB_CHUNK_SIZE];
+    // 3. Read frames until we get a matching ChannelAllocationResponse.
+    //    Per THP spec §"Allocation layer": "If the received nonce differs from
+    //    the sent nonce, the host application ignores the response and keeps
+    //    waiting for a ChannelAllocationResponse that has a matching nonce."
+    //    We also ignore stale frames left in the USB buffer from prior sessions
+    //    (wrong channel id, wrong control byte, truncated payload). Eventually
+    //    the underlying transport will time out, which propagates as
+    //    TimeoutException so auto_detect can fall through to V1.
     while (true) {
-      const size_t got = (timeout_ms != 0)
-          ? transport.read_chunk(chunk, sizeof(chunk), timeout_ms)
-          : transport.read_chunk(chunk, sizeof(chunk));
-      if (got != USB_CHUNK_SIZE) {
-        throw exc::CommunicationException("THP: short chunk during channel allocation");
+      Frame f = read_one_frame(transport, timeout_ms);
+
+      if (f.channel_id != CID_BROADCAST) {
+        MWARNING("THP alloc: ignoring frame on non-broadcast channel 0x"
+                 << std::hex << f.channel_id);
+        continue;
       }
-      if (asm_.feed_chunk(chunk, USB_CHUNK_SIZE)) {
-        break;
+      if (f.control_byte != CTRL_CHANNEL_ALLOC_RESPONSE) {
+        MWARNING("THP alloc: ignoring frame with control byte 0x"
+                 << std::hex << int(f.control_byte));
+        continue;
       }
-    }
-    Frame f = asm_.take();
+      if (f.payload.size() < ALLOC_RESPONSE_FIXED_BYTES) {
+        MWARNING("THP alloc: ignoring truncated alloc response (size=" << f.payload.size() << ")");
+        continue;
+      }
+      if (std::memcmp(f.payload.data(), out.nonce.data(), NONCE_BYTES) != 0) {
+        MWARNING("THP alloc: ignoring response with mismatched nonce (likely stale from previous session)");
+        continue;
+      }
 
-    // 4. Validate response.
-    if (f.channel_id != CID_BROADCAST) {
-      throw exc::CommunicationException("THP: alloc response not on broadcast channel");
-    }
-    if (f.control_byte != CTRL_CHANNEL_ALLOC_RESPONSE) {
-      throw exc::CommunicationException("THP: unexpected control byte in alloc response");
-    }
-    if (f.payload.size() < ALLOC_RESPONSE_FIXED_BYTES) {
-      throw exc::CommunicationException("THP: alloc response truncated");
-    }
-    if (std::memcmp(f.payload.data(), out.nonce.data(), NONCE_BYTES) != 0) {
-      throw exc::CommunicationException("THP: alloc response nonce mismatch");
-    }
-    out.channel_id = read_be16(f.payload.data() + NONCE_BYTES);
-    if (out.channel_id == CID_INVALID || out.channel_id >= CID_RESERVED_LOW) {
-      throw exc::CommunicationException("THP: device returned reserved CID");
-    }
+      out.channel_id = read_be16(f.payload.data() + NONCE_BYTES);
+      if (out.channel_id == CID_INVALID || out.channel_id >= CID_RESERVED_LOW) {
+        throw exc::CommunicationException("THP: device returned reserved CID");
+      }
 
-    // The remaining bytes are the protobuf-encoded device properties; the
-    // caller (ProtocolV2) decodes them lazily.
-    if (f.payload.size() > ALLOC_RESPONSE_FIXED_BYTES) {
-      out.device_properties_pb.assign(f.payload.begin() + ALLOC_RESPONSE_FIXED_BYTES,
-                                      f.payload.end());
+      // The remaining bytes are the protobuf-encoded device properties; the
+      // caller (ProtocolV2) decodes them lazily.
+      if (f.payload.size() > ALLOC_RESPONSE_FIXED_BYTES) {
+        out.device_properties_pb.assign(f.payload.begin() + ALLOC_RESPONSE_FIXED_BYTES,
+                                        f.payload.end());
+      }
+      return out;
     }
-
-    return out;
   }
 
 }}}
