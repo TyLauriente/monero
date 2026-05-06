@@ -828,6 +828,29 @@ TEST(thp_elligator2, deterministic_known_inputs)
   EXPECT_NE(0, std::memcmp(out1, out2, 32));
 }
 
+// Regression: per RFC 7748 §5 / RFC 9380 §G.2.1, decode_coordinate must
+// clear the high bit of the input before reducing mod p. The Python
+// reference (trezorlib/thp/curve25519.py) does `array[-1] &= 0x7F`. If we
+// skip that mask, ~50% of pairings (whenever SHA-512's truncated high
+// bit is set) produce a different field element than the device, and
+// CPace tags mismatch even with the correct user code.
+TEST(thp_elligator2, decode_coordinate_masks_high_bit)
+{
+  uint8_t with_high_bit[32]    = {0}; with_high_bit[31]    = 0x81;
+  uint8_t without_high_bit[32] = {0}; without_high_bit[31] = 0x01;
+  uint8_t out_a[32], out_b[32];
+  elligator2_curve25519(with_high_bit,    out_a);
+  elligator2_curve25519(without_high_bit, out_b);
+  EXPECT_EQ(0, std::memcmp(out_a, out_b, 32))
+      << "elligator2 must mask the high bit of the input (RFC 7748 §5)";
+
+  // Sanity: the mask actually changes nothing when the high bit was
+  // already clear — the same bytes produce the same output.
+  uint8_t out_c[32];
+  elligator2_curve25519(without_high_bit, out_c);
+  EXPECT_EQ(0, std::memcmp(out_b, out_c, 32));
+}
+
 TEST(thp_elligator2, cpace_generator_binds_code_and_handshake_hash)
 {
   NoiseHash h{}; for (size_t i = 0; i < h.size(); ++i) h[i] = uint8_t(i);

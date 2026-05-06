@@ -125,9 +125,19 @@ namespace hw { namespace trezor { namespace thp {
     BN_set_word(two.p, 2);
     BN_set_word(one.p, 1);
 
-    Bn u; le_to_bn(r_bytes, u.p);
-    // Reduce u mod p (input may exceed p — caller passes raw 32 bytes).
+    // Per RFC 7748 §5 / RFC 9380 §G.2.1, decode_coordinate clears the high
+    // bit (bit 255) before converting the 32 little-endian bytes to a field
+    // element. The reference Python trezorlib does this in
+    // curve25519.decode_coordinate (`array[-1] &= 0x7F`); without the mask
+    // we get a different `u` than the device whenever SHA-512's truncated
+    // high bit is set (~50% of pairings), and CPace tags mismatch.
+    uint8_t masked[32];
+    std::memcpy(masked, r_bytes, 32);
+    masked[31] &= 0x7F;
+
+    Bn u; le_to_bn(masked, u.p);
     BN_mod(u.p, u.p, p.p, ctx.p);
+    sodium_memzero(masked, sizeof(masked));
 
     // d = 1 + Z * u^2 (Z = 2)
     Bn u2;     BN_mod_sqr(u2.p, u.p, p.p, ctx.p);
