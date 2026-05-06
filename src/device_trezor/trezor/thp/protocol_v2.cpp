@@ -102,7 +102,7 @@ namespace hw { namespace trezor { namespace thp {
     if (!m_have_allocation) {
       m_channel = allocate_channel(transport);
     }
-    MDEBUG("THP: allocated channel " << m_channel.channel_id);
+    MWARNING("THP: allocated channel " << m_channel.channel_id);
 
     // 2. Wire device properties + persisted credentials into the handshake.
     m_handshake.set_device_properties(m_channel.device_properties_pb.data(),
@@ -110,30 +110,38 @@ namespace hw { namespace trezor { namespace thp {
     m_handshake.set_host_static_key(m_host_static);
     m_handshake.set_known_devices(m_known_devices);
 
-    // Helper: read frames, dropping any unsolicited transport-error/ping
-    // frames, until we see one whose control byte matches `want_ctrl`. ACK
-    // frames addressed to the host are consumed via consume_ack() instead.
-    auto recv_specific = [&](uint8_t want_ctrl, const char *what) -> Frame {
+    // Per THP spec (docs/common/thp/specification.md):
+    //  - Message-type mask is 0xE7 (bit 3 = seq, bit 4 = piggyback ACK).
+    //  - ACK-type mask is 0xF7 (bit 3 = seq).
+    // We compare under those masks so a piggybacked ACK on a handshake
+    // response, or a vendor-quirk variant, doesn't trip the matcher.
+    constexpr uint8_t MSG_TYPE_MASK = 0xE7;
+    constexpr uint8_t ACK_TYPE_MASK = 0xF7;
+    auto hex2 = [](uint8_t b){ char s[5]; std::snprintf(s, sizeof(s), "%02x", b); return std::string(s); };
+
+    auto recv_specific = [&](uint8_t want_base, const char *what) -> Frame {
       while (true) {
         Frame fr = recv_frame(transport);
+        MWARNING("THP: rx ctrl=0x" << hex2(fr.control_byte)
+               << " cid=0x" << std::hex << fr.channel_id << std::dec
+               << " len=" << fr.payload.size()
+               << " (waiting for " << what << ")");
         if (fr.channel_id != m_channel.channel_id) {
           MWARNING("THP: dropping frame on unexpected channel " << fr.channel_id);
           continue;
         }
-        if (fr.control_byte == want_ctrl) {
+        if ((fr.control_byte & MSG_TYPE_MASK) == (want_base & MSG_TYPE_MASK)) {
           return fr;
         }
         if (fr.is_ack()) {
-          // Stray ACK before our expected response — log and keep waiting.
-          MDEBUG("THP: stray ACK while waiting for " << what);
+          MWARNING("THP: stray ACK 0x" << hex2(fr.control_byte) << " while waiting for " << what);
           continue;
         }
         if (fr.control_byte == CTRL_TRANSPORT_ERROR) {
           throw exc::ProtocolException(std::string("THP: transport error during ") + what);
         }
         throw exc::ProtocolException(std::string("THP: unexpected frame waiting for ") + what +
-                                     " (got control 0x" +
-                                     [&]{ char b[5]; std::snprintf(b, sizeof(b), "%02x", fr.control_byte); return std::string(b); }() + ")");
+                                     " (got control 0x" + hex2(fr.control_byte) + ")");
       }
     };
 
@@ -141,48 +149,57 @@ namespace hw { namespace trezor { namespace thp {
       const uint8_t want_ctrl = want_seq ? CTRL_ACK_SEQ1 : CTRL_ACK_SEQ0;
       while (true) {
         Frame fr = recv_frame(transport);
+        MWARNING("THP: rx ctrl=0x" << hex2(fr.control_byte)
+               << " cid=0x" << std::hex << fr.channel_id << std::dec
+               << " (waiting for ACK seq=" << int(want_seq) << " after " << what << ")");
         if (fr.channel_id != m_channel.channel_id) {
           continue;
         }
-        if (fr.control_byte == want_ctrl) {
+        if ((fr.control_byte & ACK_TYPE_MASK) == want_ctrl) {
           return;
         }
         if (fr.is_ack()) {
-          // Wrong-seq ACK; ignore and keep reading.
-          MDEBUG("THP: ignoring ACK with mismatched seq while waiting for ACK after " << what);
+          MWARNING("THP: ignoring ACK 0x" << hex2(fr.control_byte) << " (wrong seq) after " << what);
           continue;
         }
-        throw exc::ProtocolException(std::string("THP: expected ACK after ") + what);
+        throw exc::ProtocolException(std::string("THP: expected ACK after ") + what +
+                                     " (got control 0x" + hex2(fr.control_byte) + ")");
       }
     };
 
-    // 3. host -> device: HandshakeInitiationRequest (control 0x00, seq=0)
+    MINFO("THP: starting handshake on channel " << m_channel.channel_id);
+
+    // 3. host -> device: HandshakeInitiationRequest (base 0x00, seq=0).
     auto init_req = m_handshake.build_init_request(/*try_to_unlock=*/false);
+    MWARNING("THP: tx HandshakeInitRequest len=" << init_req.size());
     send_frame(transport, CTRL_HANDSHAKE_INIT_REQ,
                init_req.data(), init_req.size());
-    // 3a. device ACKs the request (seq=0)
+    // 3a. device ACKs the request (seq=0).
     consume_ack(0, "HandshakeInitRequest");
 
-    // 4. device -> host: HandshakeInitiationResponse (control 0x01)
+    // 4. device -> host: HandshakeInitiationResponse (base 0x01, device seq=0).
     Frame init_resp = recv_specific(CTRL_HANDSHAKE_INIT_RESP, "HandshakeInitResponse");
     m_handshake.consume_init_response(init_resp.payload.data(),
                                       init_resp.payload.size());
-    // 4a. host ACKs the response (seq=0)
+    // 4a. host ACKs the response (seq=0).
     send_frame(transport, CTRL_ACK_SEQ0, nullptr, 0);
 
-    // 5. host -> device: HandshakeCompletionRequest (control 0x02, seq=1)
+    // 5. host -> device: HandshakeCompletionRequest (base 0x02, seq=1 → wire 0x0A).
     auto comp_req = m_handshake.build_completion_request();
-    send_frame(transport, CTRL_HANDSHAKE_COMP_REQ,
+    MWARNING("THP: tx HandshakeCompletionRequest len=" << comp_req.size() << " ctrl=0x0a");
+    send_frame(transport, CTRL_HANDSHAKE_COMP_REQ | CTRL_SEQ_BIT,
                comp_req.data(), comp_req.size());
-    // 5a. device ACKs (seq=1)
+    // 5a. device ACKs (seq=1).
     consume_ack(1, "HandshakeCompletionRequest");
 
-    // 6. device -> host: HandshakeCompletionResponse (control 0x03)
+    // 6. device -> host: HandshakeCompletionResponse (base 0x03, device seq=1 → wire 0x0B).
     Frame comp_resp = recv_specific(CTRL_HANDSHAKE_COMP_RESP, "HandshakeCompletionResponse");
     m_handshake.consume_completion_response(comp_resp.payload.data(),
                                             comp_resp.payload.size());
-    // 6a. host ACKs (seq=1)
+    // 6a. host ACKs (seq=1).
     send_frame(transport, CTRL_ACK_SEQ1, nullptr, 0);
+
+    MINFO("THP: handshake complete on channel " << m_channel.channel_id);
 
     // 7. Build cipherstates per specification.md (encryption_state: nonce
     //    counters start at 0 for outgoing requests and 1 for incoming
