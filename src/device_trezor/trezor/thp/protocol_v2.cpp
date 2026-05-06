@@ -259,18 +259,37 @@ namespace hw { namespace trezor { namespace thp {
     //   bytes 3.. : protobuf-serialized payload
     constexpr uint8_t SESSION_ID_MANAGEMENT = 0x00;
     constexpr size_t  PLAIN_HEADER_LEN      = 3;
-    const uint16_t wire_num = MessageMapper::get_message_wire_number(req);
+    uint16_t wire_num = MessageMapper::get_message_wire_number(req);
 #if GOOGLE_PROTOBUF_VERSION < 3006001
-    const size_t msg_size = req.ByteSize();
+    size_t msg_size = req.ByteSize();
 #else
-    const size_t msg_size = req.ByteSizeLong();
+    size_t msg_size = req.ByteSizeLong();
 #endif
+
+    // V1-vs-V2 message translation. Monero's device_trezor_base unconditionally
+    // sends a management::Initialize (msg_type 0) at the start of every command
+    // chain. THP devices reject Initialize as Failure_UnexpectedMessage; the
+    // canonical trezorlib client uses GetFeatures (msg_type 55) instead. The
+    // Initialize.session_id field is meaningless under THP (sessions are
+    // multiplexed via the encrypted plaintext header byte, not in-protobuf),
+    // so we drop the body and send an empty GetFeatures.
+    constexpr uint16_t WIRE_INITIALIZE  = 0;
+    constexpr uint16_t WIRE_GET_FEATURES = 55;
+    bool translated_initialize = false;
+    if (wire_num == WIRE_INITIALIZE) {
+      wire_num = WIRE_GET_FEATURES;
+      msg_size = 0; // GetFeatures has no fields
+      translated_initialize = true;
+    }
+
     std::vector<uint8_t> plain;
     plain.resize(PLAIN_HEADER_LEN + msg_size);
     plain[0] = SESSION_ID_MANAGEMENT;
     write_be16(plain.data() + 1, wire_num);
-    if (!req.SerializeToArray(plain.data() + PLAIN_HEADER_LEN, msg_size)) {
-      throw exc::EncodingException("THP: protobuf serialize failed");
+    if (!translated_initialize && msg_size > 0) {
+      if (!req.SerializeToArray(plain.data() + PLAIN_HEADER_LEN, msg_size)) {
+        throw exc::EncodingException("THP: protobuf serialize failed");
+      }
     }
 
     std::vector<uint8_t> sealed;
