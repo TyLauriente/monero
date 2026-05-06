@@ -147,7 +147,6 @@ namespace hw { namespace trezor { namespace thp {
     };
 
     auto consume_ack = [&](uint8_t want_seq, const char *what) {
-      const uint8_t want_ctrl = want_seq ? CTRL_ACK_SEQ1 : CTRL_ACK_SEQ0;
       while (true) {
         Frame fr = recv_frame(transport);
         MWARNING("THP: rx ctrl=0x" << hex2(fr.control_byte)
@@ -156,10 +155,15 @@ namespace hw { namespace trezor { namespace thp {
         if (fr.channel_id != m_channel.channel_id) {
           continue;
         }
-        if ((fr.control_byte & ACK_TYPE_MASK) == want_ctrl) {
-          return;
-        }
+        // ACK match must check is_ack() (under CTRL_ACK_MASK 0xF7, which
+        // strips bit 3 / the seq bit) AND then read the seq bit from the
+        // raw control byte. Comparing the masked value to an unmasked
+        // CTRL_ACK_SEQ1 (=0x28) would always fail because the mask clears
+        // the seq bit on the left side of the equality.
         if (fr.is_ack()) {
+          if (fr.ack_seq_bit() == want_seq) {
+            return;
+          }
           MWARNING("THP: ignoring ACK 0x" << hex2(fr.control_byte) << " (wrong seq) after " << what);
           continue;
         }
