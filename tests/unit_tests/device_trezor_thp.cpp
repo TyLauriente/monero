@@ -142,14 +142,15 @@ TEST(thp_framing, continuation_byte_is_exactly_0x80)
   // would be rejected by a strict device parser.
   //
   // Use an initiation control byte with non-zero low bits (encrypted
-  // transport with seq=1: 0x0C) and a payload large enough to span at
-  // least three USB chunks. Then assert that every continuation chunk
-  // carries control byte 0x80, regardless of the initiation control.
+  // transport with seq=1: 0x14, where 0x10 is CTRL_DATA_SEQ_BIT) and a
+  // payload large enough to span at least three USB chunks. Then assert
+  // that every continuation chunk carries control byte 0x80, regardless
+  // of the initiation control.
   std::vector<uint8_t> payload(180, 0xCD);
-  auto wire = encode_frame(0x0C /*encrypted, seq=1*/, 0x0042,
+  auto wire = encode_frame(0x14 /*encrypted, seq=1*/, 0x0042,
                            payload.data(), payload.size());
   ASSERT_GE(wire.size(), USB_CHUNK_SIZE * 3);
-  EXPECT_EQ(0x0C, wire[0]);  // initiation chunk: original ctrl
+  EXPECT_EQ(0x14, wire[0]);  // initiation chunk: original ctrl
   for (size_t off = USB_CHUNK_SIZE; off < wire.size(); off += USB_CHUNK_SIZE) {
     EXPECT_EQ(0x80, wire[off]) << "continuation chunk at offset " << off
         << " has wrong control byte (must be 0x80, got 0x"
@@ -190,6 +191,90 @@ TEST(thp_framing, crc_mismatch_throws)
 
   FrameAssembler asm_;
   EXPECT_THROW(asm_.feed_chunk(wire.data(), USB_CHUNK_SIZE), std::exception);
+}
+
+// Regression: the data-packet sequence bit lives at 0x10, not 0x08.
+//
+// THP spec §"Transport packet structure" defines DATA packets as
+// `000XX100` under mask 0xE7. Bit 4 (0x10) is the seq bit; bit 3 (0x08)
+// is the optional piggyback-ACK bit. An earlier bug had us OR'ing 0x08
+// into the control byte to mark seq=1, which the device reads as a
+// repeated seq=0 frame plus a piggyback-ACK signal — wedging the
+// alternating-bit protocol on every multi-frame exchange (notably
+// HandshakeCompletionRequest, which is the first frame to need seq=1).
+TEST(thp_framing, data_seq_bit_is_0x10_not_0x08)
+{
+  EXPECT_EQ(0x10, CTRL_DATA_SEQ_BIT);
+  EXPECT_EQ(0x08, CTRL_DATA_ACK_BIT);
+  EXPECT_EQ(0x08, CTRL_ACK_SEQ_BIT);
+  EXPECT_EQ(0xE7, CTRL_DATA_MASK);
+  EXPECT_EQ(0xF7, CTRL_ACK_MASK);
+
+  // Encrypted transport, seq=1: wire byte must be 0x04 | 0x10 = 0x14.
+  Frame f_seq1{};
+  f_seq1.control_byte = static_cast<uint8_t>(CTRL_ENCRYPTED_TRANSPORT |
+                                             CTRL_DATA_SEQ_BIT);
+  EXPECT_EQ(0x14, f_seq1.control_byte);
+  EXPECT_EQ(1, f_seq1.data_seq_bit());
+  EXPECT_EQ(0, f_seq1.data_ack_bit());
+  EXPECT_FALSE(f_seq1.is_ack());
+  // Must match encrypted_transport under DATA_MASK (0xE7).
+  EXPECT_EQ(CTRL_ENCRYPTED_TRANSPORT, f_seq1.control_byte & CTRL_DATA_MASK);
+
+  // Same with piggyback ACK bit set as well: 0x04 | 0x10 | 0x08 = 0x1C.
+  Frame f_both{};
+  f_both.control_byte = static_cast<uint8_t>(CTRL_ENCRYPTED_TRANSPORT |
+                                             CTRL_DATA_SEQ_BIT |
+                                             CTRL_DATA_ACK_BIT);
+  EXPECT_EQ(0x1C, f_both.control_byte);
+  EXPECT_EQ(1, f_both.data_seq_bit());
+  EXPECT_EQ(1, f_both.data_ack_bit());
+  EXPECT_EQ(CTRL_ENCRYPTED_TRANSPORT, f_both.control_byte & CTRL_DATA_MASK);
+
+  // ACK_SEQ1 is 0x28 — sequence bit at 0x08 on ACK packets, distinct from
+  // the data-packet position.
+  Frame ack1{};
+  ack1.control_byte = CTRL_ACK_SEQ1;
+  EXPECT_TRUE(ack1.is_ack());
+  EXPECT_EQ(1, ack1.ack_seq_bit());
+
+  Frame ack0{};
+  ack0.control_byte = CTRL_ACK_SEQ0;
+  EXPECT_TRUE(ack0.is_ack());
+  EXPECT_EQ(0, ack0.ack_seq_bit());
+}
+
+// Regression: HandshakeCompletionRequest control byte must be 0x12, not
+// 0x0A. With the old bug `CTRL_HANDSHAKE_COMP_REQ | CTRL_SEQ_BIT(=0x08)`
+// produced 0x0A, which the device interprets as "seq=0 with piggyback
+// ACK" — a duplicate of the init request. Real Safe 7 firmware silently
+// drops it and the wallet hangs forever on "Creating wallet from
+// device...". The correct wire byte sets the data-seq bit at 0x10.
+TEST(thp_framing, handshake_completion_request_wire_byte_is_0x12)
+{
+  const uint8_t expected = CTRL_HANDSHAKE_COMP_REQ | CTRL_DATA_SEQ_BIT;
+  EXPECT_EQ(0x12, expected);
+
+  // And verify it round-trips through encode_frame / FrameAssembler.
+  std::vector<uint8_t> payload(40, 0x55);
+  auto wire = encode_frame(expected, 0x1234,
+                           payload.data(), payload.size());
+  ASSERT_GE(wire.size(), USB_CHUNK_SIZE);
+  EXPECT_EQ(0x12, wire[0]);
+
+  FrameAssembler asm_;
+  bool done = false;
+  for (size_t off = 0; off + USB_CHUNK_SIZE <= wire.size(); off += USB_CHUNK_SIZE) {
+    done = asm_.feed_chunk(wire.data() + off, USB_CHUNK_SIZE);
+  }
+  ASSERT_TRUE(done);
+  Frame f = asm_.take();
+  EXPECT_EQ(0x12, f.control_byte);
+  // It is a DATA packet, not an ACK; matches handshake_completion_request
+  // under DATA_MASK and has seq=1.
+  EXPECT_FALSE(f.is_ack());
+  EXPECT_EQ(CTRL_HANDSHAKE_COMP_REQ, f.control_byte & CTRL_DATA_MASK);
+  EXPECT_EQ(1, f.data_seq_bit());
 }
 
 // ---------------------------------------------------------------------------

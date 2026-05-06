@@ -114,8 +114,13 @@ namespace hw { namespace trezor { namespace thp {
     std::vector<KnownDevice> m_known_devices;
     std::unique_ptr<TransportCipher> m_send_cipher;
     std::unique_ptr<TransportCipher> m_recv_cipher;
-    uint8_t           m_send_seq = 0; // alternating bit
-    uint8_t           m_recv_seq = 0; // alternating bit
+    // Alternating-bit sequence counters for the encrypted-transport phase.
+    // Both start at 0 because by the time encrypted transport begins, the
+    // handshake has already toggled sync_bit_send twice (init_req → 0,
+    // comp_req → 1) and sync_bit_receive twice (init_resp → 0, comp_resp →
+    // 1), bringing both back to 0. See THP spec §"Alternating Bit Protocol".
+    uint8_t           m_send_seq = 0;
+    uint8_t           m_recv_seq = 0;
     bool              m_session_open = false;
   };
 

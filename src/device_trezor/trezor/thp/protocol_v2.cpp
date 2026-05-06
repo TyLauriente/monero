@@ -110,13 +110,14 @@ namespace hw { namespace trezor { namespace thp {
     m_handshake.set_host_static_key(m_host_static);
     m_handshake.set_known_devices(m_known_devices);
 
-    // Per THP spec (docs/common/thp/specification.md):
-    //  - Message-type mask is 0xE7 (bit 3 = seq, bit 4 = piggyback ACK).
-    //  - ACK-type mask is 0xF7 (bit 3 = seq).
-    // We compare under those masks so a piggybacked ACK on a handshake
-    // response, or a vendor-quirk variant, doesn't trip the matcher.
-    constexpr uint8_t MSG_TYPE_MASK = 0xE7;
-    constexpr uint8_t ACK_TYPE_MASK = 0xF7;
+    // Per THP spec (docs/common/thp/specification.md, "Transport packet
+    // structure" table):
+    //  - DATA-packet type mask is 0xE7. Bit 4 (0x10) is the sequence bit;
+    //    bit 3 (0x08) is the optional piggyback-ACK bit. Both must be
+    //    masked off when matching the message type.
+    //  - ACK-packet type mask is 0xF7. Bit 3 (0x08) is the sequence bit.
+    constexpr uint8_t MSG_TYPE_MASK = CTRL_DATA_MASK; // 0xE7
+    constexpr uint8_t ACK_TYPE_MASK = CTRL_ACK_MASK;  // 0xF7
     auto hex2 = [](uint8_t b){ char s[5]; std::snprintf(s, sizeof(s), "%02x", b); return std::string(s); };
 
     auto recv_specific = [&](uint8_t want_base, const char *what) -> Frame {
@@ -184,15 +185,18 @@ namespace hw { namespace trezor { namespace thp {
     // 4a. host ACKs the response (seq=0).
     send_frame(transport, CTRL_ACK_SEQ0, nullptr, 0);
 
-    // 5. host -> device: HandshakeCompletionRequest (base 0x02, seq=1 → wire 0x0A).
+    // 5. host -> device: HandshakeCompletionRequest (base 0x02, seq=1 → wire 0x12).
+    //    Per THP spec, the data-packet sequence bit lives at 0x10, not 0x08.
+    //    Bit 0x08 is the optional piggyback-ACK bit and must remain 0 here
+    //    (host has already sent a standalone ACK_SEQ0 for the init response).
     auto comp_req = m_handshake.build_completion_request();
-    MWARNING("THP: tx HandshakeCompletionRequest len=" << comp_req.size() << " ctrl=0x0a");
-    send_frame(transport, CTRL_HANDSHAKE_COMP_REQ | CTRL_SEQ_BIT,
+    MWARNING("THP: tx HandshakeCompletionRequest len=" << comp_req.size() << " ctrl=0x12");
+    send_frame(transport, CTRL_HANDSHAKE_COMP_REQ | CTRL_DATA_SEQ_BIT,
                comp_req.data(), comp_req.size());
     // 5a. device ACKs (seq=1).
     consume_ack(1, "HandshakeCompletionRequest");
 
-    // 6. device -> host: HandshakeCompletionResponse (base 0x03, device seq=1 → wire 0x0B).
+    // 6. device -> host: HandshakeCompletionResponse (base 0x03, device seq=1 → wire 0x13).
     Frame comp_resp = recv_specific(CTRL_HANDSHAKE_COMP_RESP, "HandshakeCompletionResponse");
     m_handshake.consume_completion_response(comp_resp.payload.data(),
                                             comp_resp.payload.size());
@@ -242,9 +246,15 @@ namespace hw { namespace trezor { namespace thp {
       throw exc::ProtocolException("THP: write before session_begin");
     }
 
-    // Serialize the protobuf message: 2-byte big-endian message wire
-    // number followed by the protobuf bytes (per THP encrypted-transport
-    // payload format).
+    // Plaintext layout for THP application messages (matches the canonical
+    // Python `trezorlib.thp.client` HEADER_FMT = ">BH"):
+    //   byte 0    : session_id (1 byte)  — 0x00 for the management session
+    //                                       used by pairing/credential and
+    //                                       Monero's single-session traffic
+    //   bytes 1-2 : message_type wire number (uint16, big-endian)
+    //   bytes 3.. : protobuf-serialized payload
+    constexpr uint8_t SESSION_ID_MANAGEMENT = 0x00;
+    constexpr size_t  PLAIN_HEADER_LEN      = 3;
     const uint16_t wire_num = MessageMapper::get_message_wire_number(req);
 #if GOOGLE_PROTOBUF_VERSION < 3006001
     const size_t msg_size = req.ByteSize();
@@ -252,9 +262,10 @@ namespace hw { namespace trezor { namespace thp {
     const size_t msg_size = req.ByteSizeLong();
 #endif
     std::vector<uint8_t> plain;
-    plain.resize(2 + msg_size);
-    write_be16(plain.data(), wire_num);
-    if (!req.SerializeToArray(plain.data() + 2, msg_size)) {
+    plain.resize(PLAIN_HEADER_LEN + msg_size);
+    plain[0] = SESSION_ID_MANAGEMENT;
+    write_be16(plain.data() + 1, wire_num);
+    if (!req.SerializeToArray(plain.data() + PLAIN_HEADER_LEN, msg_size)) {
       throw exc::EncodingException("THP: protobuf serialize failed");
     }
 
@@ -263,7 +274,7 @@ namespace hw { namespace trezor { namespace thp {
                         plain.data(), plain.size(), sealed);
 
     const uint8_t control = CTRL_ENCRYPTED_TRANSPORT |
-                            (m_send_seq ? CTRL_SEQ_BIT : 0);
+                            (m_send_seq ? CTRL_DATA_SEQ_BIT : 0);
     send_frame(transport, control, sealed.data(), sealed.size());
 
     // Wait for the device's ACK on the alternating bit. Real impls would
@@ -284,11 +295,14 @@ namespace hw { namespace trezor { namespace thp {
     }
 
     Frame f = recv_frame(transport);
-    if ((f.control_byte & 0xF7) != CTRL_ENCRYPTED_TRANSPORT ||
+    // Match encrypted_transport under the spec's DATA_MASK (0xE7), which
+    // strips both the seq bit (0x10) and the optional piggyback-ACK bit
+    // (0x08). Using 0xF7 here would reject every frame with seq=1.
+    if ((f.control_byte & CTRL_DATA_MASK) != CTRL_ENCRYPTED_TRANSPORT ||
         f.channel_id != m_channel.channel_id) {
       throw exc::ProtocolException("THP: read got unexpected frame type");
     }
-    const uint8_t got_seq = f.sequence_bit();
+    const uint8_t got_seq = f.data_seq_bit();
     if (got_seq != m_recv_seq) {
       throw exc::ProtocolException("THP: out-of-order encrypted frame");
     }
@@ -298,13 +312,18 @@ namespace hw { namespace trezor { namespace thp {
                              f.payload.data(), f.payload.size(), plain)) {
       throw exc::SecurityException("THP: AES-GCM decrypt failed");
     }
-    if (plain.size() < 2) {
+    // Plaintext: session_id(1) || msg_type(2 BE) || protobuf payload.
+    constexpr size_t PLAIN_HEADER_LEN = 3;
+    if (plain.size() < PLAIN_HEADER_LEN) {
       throw exc::ProtocolException("THP: decrypted payload too small");
     }
-    const uint16_t wire_num = read_be16(plain.data());
+    // session_id is currently informational; the management session uses 0
+    // and Monero traffic does not multiplex across sessions yet.
+    const uint16_t wire_num = read_be16(plain.data() + 1);
 
     std::shared_ptr<google::protobuf::Message> wrap(MessageMapper::get_message(wire_num));
-    if (!wrap->ParseFromArray(plain.data() + 2, plain.size() - 2)) {
+    if (!wrap->ParseFromArray(plain.data() + PLAIN_HEADER_LEN,
+                              plain.size() - PLAIN_HEADER_LEN)) {
       throw exc::EncodingException("THP: protobuf parse failed");
     }
     msg = wrap;

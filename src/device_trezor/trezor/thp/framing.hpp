@@ -42,9 +42,18 @@ namespace hw { namespace trezor { namespace thp {
 
   // Control-byte masks. Bit 7 distinguishes initiation (0) vs continuation (1).
   constexpr uint8_t CTRL_CONTINUATION_BIT = 0x80;
-  // Sequence bit: bit 3 (0x08) on initiation packets that carry a sequence-
-  // number-bearing message (handshake / encrypted transport / ACK).
-  constexpr uint8_t CTRL_SEQ_BIT = 0x08;
+  // Per THP spec §"Transport packet structure":
+  //   - DATA packets (handshake_*, encrypted_transport): bit 4 (0x10) is the
+  //     sequence bit; bit 3 (0x08) is the optional piggyback-ACK bit.
+  //   - ACK packets: bit 3 (0x08) is the sequence bit (which seq is being
+  //     acknowledged); there is no piggyback bit.
+  // The single-bit names match Python trezorlib/thp/control_byte.py.
+  constexpr uint8_t CTRL_DATA_SEQ_BIT = 0x10;
+  constexpr uint8_t CTRL_DATA_ACK_BIT = 0x08;
+  constexpr uint8_t CTRL_ACK_SEQ_BIT  = 0x08;
+  // Property masks used to identify the message type ignoring seq/ack bits.
+  constexpr uint8_t CTRL_DATA_MASK = 0xE7;  // strips seq (0x10) and ack (0x08)
+  constexpr uint8_t CTRL_ACK_MASK  = 0xF7;  // strips seq (0x08)
 
   // Reserved channel identifiers per THP spec.
   constexpr uint16_t CID_BROADCAST = 0xFFFF;
@@ -70,8 +79,9 @@ namespace hw { namespace trezor { namespace thp {
     CTRL_HANDSHAKE_COMP_REQ     = 0x02,
     CTRL_HANDSHAKE_COMP_RESP    = 0x03,
 
-    // Encrypted application traffic. Sequence bit (CTRL_SEQ_BIT) toggles
-    // between consecutive frames (yielding 0x04 / 0x0C).
+    // Encrypted application traffic. Sequence bit (CTRL_DATA_SEQ_BIT 0x10)
+    // toggles between consecutive frames (yielding 0x04 / 0x14). The
+    // optional piggyback-ACK bit (CTRL_DATA_ACK_BIT 0x08) may also be set.
     CTRL_ENCRYPTED_TRANSPORT    = 0x04,
   };
 
@@ -92,8 +102,13 @@ namespace hw { namespace trezor { namespace thp {
     std::vector<uint8_t> payload;
 
     bool is_continuation() const { return (control_byte & CTRL_CONTINUATION_BIT) != 0; }
-    bool is_ack() const          { return (control_byte & 0xF7) == CTRL_ACK_SEQ0; }
-    uint8_t sequence_bit() const { return (control_byte & CTRL_SEQ_BIT) ? 1 : 0; }
+    bool is_ack() const          { return (control_byte & CTRL_ACK_MASK) == CTRL_ACK_SEQ0; }
+    // For DATA packets (handshake_*, encrypted_transport): sequence bit is at 0x10.
+    uint8_t data_seq_bit() const { return (control_byte & CTRL_DATA_SEQ_BIT) ? 1 : 0; }
+    // For DATA packets: piggyback-ACK bit is at 0x08.
+    uint8_t data_ack_bit() const { return (control_byte & CTRL_DATA_ACK_BIT) ? 1 : 0; }
+    // For ACK packets: sequence bit is at 0x08.
+    uint8_t ack_seq_bit()  const { return (control_byte & CTRL_ACK_SEQ_BIT)  ? 1 : 0; }
   };
 
   // Build the wire bytes for a single transport-layer frame. Splits the
