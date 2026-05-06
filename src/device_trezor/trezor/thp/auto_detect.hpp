@@ -104,6 +104,14 @@ namespace hw { namespace trezor { namespace thp {
     // post-handshake transport cipherstates set up).
     void run_code_entry_pairing(Transport &transport);
 
+    // Read the next encrypted message from `m_v2`, transparently ACKing
+    // any common.ButtonRequest and surfacing common.Failure as a typed
+    // FailureException. Returns the first non-button, non-failure
+    // message. `expected` names the message we're waiting for, used in
+    // the diagnostic if a Failure arrives without its own message.
+    std::shared_ptr<google::protobuf::Message>
+    read_handling_buttons(Transport &transport, const char *expected);
+
     ProtocolConfig                        m_config;
     std::shared_ptr<Protocol>             m_actual;     // v1 or v2 once selected
     std::shared_ptr<ProtocolV2>           m_v2;         // shortcut typed alias
