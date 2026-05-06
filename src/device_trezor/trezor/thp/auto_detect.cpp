@@ -130,72 +130,75 @@ namespace hw { namespace trezor { namespace thp {
             "THP: device is unpaired and no pairing prompt is configured "
             "(set ProtocolConfig::pairing_prompt before session_begin)");
       }
-      // Make m_v2 visible to run_code_entry_pairing; clear it on any
-      // failure so the next reconnect starts clean.
+      // Make m_v2 visible to run_code_entry_pairing; reset it (and any
+      // partial promotion state) on any failure so the next reconnect
+      // starts clean. The credential round-trip + promote() are inside
+      // the same try/catch as pairing — a Failure from the device during
+      // credential issuance must NOT leave m_v2 dangling.
       m_v2 = v2;
       try {
         run_code_entry_pairing(transport);
+
+        if (have_store_path) {
+          const auto &hs = v2->host_static();
+          messages::thp::ThpCredentialRequest creq;
+          creq.set_host_static_public_key(reinterpret_cast<const char *>(hs.pub.data()),
+                                          hs.pub.size());
+          v2->write(transport, creq);
+
+          std::shared_ptr<google::protobuf::Message> resp_msg;
+          messages::MessageType msg_type;
+          v2->read(transport, resp_msg, &msg_type);
+          auto cresp = std::dynamic_pointer_cast<messages::thp::ThpCredentialResponse>(resp_msg);
+          if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(resp_msg)) {
+            throw exc::proto::FailureException(
+                fail->has_code() ? boost::optional<uint32_t>(fail->code())
+                                 : boost::optional<uint32_t>(),
+                fail->has_message() ? boost::optional<std::string>(fail->message())
+                                    : boost::optional<std::string>());
+          }
+          if (!cresp) {
+            throw exc::ProtocolException("THP: expected ThpCredentialResponse");
+          }
+
+          // ThpCredentialResponse delivers the device's *unmasked* static
+          // pubkey alongside the credential — that's how we recover it
+          // (the InitResponse only carries the masked form). We store the
+          // unmasked form so subsequent sessions can recompute the mask
+          // against each session's fresh device ephemeral pubkey.
+          const std::string &dev_static = cresp->trezor_static_public_key();
+          if (dev_static.size() != 32) {
+            throw exc::ProtocolException("THP: ThpCredentialResponse: bad trezor_static_public_key size");
+          }
+          KnownDevice kd;
+          std::memcpy(kd.trezor_static_pubkey.data(), dev_static.data(), 32);
+          kd.host_static = hs;
+          const std::string &cred = cresp->credential();
+          kd.pairing_credential.assign(cred.begin(), cred.end());
+          store.upsert_known_device(kd);
+          store.save(m_config.store_path);
+
+          // Send ThpEndRequest to leave the credential phase.
+          messages::thp::ThpEndRequest end_req;
+          v2->write(transport, end_req);
+          std::shared_ptr<google::protobuf::Message> end_resp;
+          v2->read(transport, end_resp, &msg_type);
+          if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(end_resp)) {
+            throw exc::proto::FailureException(
+                fail->has_code() ? boost::optional<uint32_t>(fail->code())
+                                 : boost::optional<uint32_t>(),
+                fail->has_message() ? boost::optional<std::string>(fail->message())
+                                    : boost::optional<std::string>());
+          }
+          if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
+            throw exc::ProtocolException("THP: expected ThpEndResponse");
+          }
+        }
+        promote();
       } catch (...) {
         m_v2.reset();
         throw;
       }
-
-      if (have_store_path) {
-        const auto &hs = v2->host_static();
-        messages::thp::ThpCredentialRequest creq;
-        creq.set_host_static_public_key(reinterpret_cast<const char *>(hs.pub.data()),
-                                        hs.pub.size());
-        v2->write(transport, creq);
-
-        std::shared_ptr<google::protobuf::Message> resp_msg;
-        messages::MessageType msg_type;
-        v2->read(transport, resp_msg, &msg_type);
-        auto cresp = std::dynamic_pointer_cast<messages::thp::ThpCredentialResponse>(resp_msg);
-        if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(resp_msg)) {
-          throw exc::proto::FailureException(
-              fail->has_code() ? boost::optional<uint32_t>(fail->code())
-                               : boost::optional<uint32_t>(),
-              fail->has_message() ? boost::optional<std::string>(fail->message())
-                                  : boost::optional<std::string>());
-        }
-        if (!cresp) {
-          throw exc::ProtocolException("THP: expected ThpCredentialResponse");
-        }
-
-        // ThpCredentialResponse delivers the device's *unmasked* static
-        // pubkey alongside the credential — that's how we recover it
-        // (the InitResponse only carries the masked form). We store the
-        // unmasked form so subsequent sessions can recompute the mask
-        // against each session's fresh device ephemeral pubkey.
-        const std::string &dev_static = cresp->trezor_static_public_key();
-        if (dev_static.size() != 32) {
-          throw exc::ProtocolException("THP: ThpCredentialResponse: bad trezor_static_public_key size");
-        }
-        KnownDevice kd;
-        std::memcpy(kd.trezor_static_pubkey.data(), dev_static.data(), 32);
-        kd.host_static = hs;
-        const std::string &cred = cresp->credential();
-        kd.pairing_credential.assign(cred.begin(), cred.end());
-        store.upsert_known_device(kd);
-        store.save(m_config.store_path);
-
-        // Send ThpEndRequest to leave the credential phase.
-        messages::thp::ThpEndRequest end_req;
-        v2->write(transport, end_req);
-        std::shared_ptr<google::protobuf::Message> end_resp;
-        v2->read(transport, end_resp, &msg_type);
-        if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(end_resp)) {
-          throw exc::proto::FailureException(
-              fail->has_code() ? boost::optional<uint32_t>(fail->code())
-                               : boost::optional<uint32_t>(),
-              fail->has_message() ? boost::optional<std::string>(fail->message())
-                                  : boost::optional<std::string>());
-        }
-        if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
-          throw exc::ProtocolException("THP: expected ThpEndResponse");
-        }
-      }
-      promote();
     } else if (v2->trezor_state() == STATE_PAIRED ||
                v2->trezor_state() == STATE_PAIRED_AUTOCONNECT) {
       // The device claims a paired session. Trust it only if our store

@@ -274,6 +274,25 @@ namespace hw { namespace trezor { namespace thp {
 
   NoiseXxInitiator::NoiseXxInitiator() = default;
 
+  NoiseXxInitiator::~NoiseXxInitiator()
+  {
+    sodium_memzero(m_host_static.priv.data(),     m_host_static.priv.size());
+    sodium_memzero(m_host_ephemeral_priv.data(),  m_host_ephemeral_priv.size());
+    sodium_memzero(m_ck_or_zero.data(),           m_ck_or_zero.size());
+    sodium_memzero(m_k_handshake.data(),          m_k_handshake.size());
+    sodium_memzero(m_h.data(),                    m_h.size());
+    sodium_memzero(m_keys.key_request.data(),     m_keys.key_request.size());
+    sodium_memzero(m_keys.key_response.data(),    m_keys.key_response.size());
+    sodium_memzero(m_keys.handshake_hash.data(),  m_keys.handshake_hash.size());
+    if (!m_pairing_credential.empty())
+      sodium_memzero(m_pairing_credential.data(), m_pairing_credential.size());
+    for (auto &kd : m_known_devices) {
+      sodium_memzero(kd.host_static.priv.data(),  kd.host_static.priv.size());
+      if (!kd.pairing_credential.empty())
+        sodium_memzero(kd.pairing_credential.data(), kd.pairing_credential.size());
+    }
+  }
+
   void NoiseXxInitiator::set_device_properties(const uint8_t *data, size_t len)
   {
     m_device_properties.assign(data, data + len);
@@ -557,6 +576,11 @@ namespace hw { namespace trezor { namespace thp {
 
   TransportCipher::TransportCipher(const NoiseKey &key, uint64_t initial_nonce)
     : m_key(key), m_counter(initial_nonce) {}
+
+  TransportCipher::~TransportCipher()
+  {
+    sodium_memzero(m_key.data(), m_key.size());
+  }
 
   void TransportCipher::seal(const uint8_t *aad, size_t aad_len,
                              const uint8_t *plaintext, size_t plaintext_len,

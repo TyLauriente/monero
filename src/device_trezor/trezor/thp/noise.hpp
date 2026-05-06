@@ -152,6 +152,12 @@ namespace hw { namespace trezor { namespace thp {
   class NoiseXxInitiator {
   public:
     NoiseXxInitiator();
+    // Destructor wipes all derived key material and the host static
+    // private key on scope exit (defense in depth against core dumps,
+    // hibernation files, debugger access).
+    ~NoiseXxInitiator();
+    NoiseXxInitiator(const NoiseXxInitiator &) = delete;
+    NoiseXxInitiator &operator=(const NoiseXxInitiator &) = delete;
 
     // Provide the device's properties as advertised in
     // ChannelAllocationResponse.device_properties. MUST be called before
@@ -252,6 +258,10 @@ namespace hw { namespace trezor { namespace thp {
   class TransportCipher {
   public:
     explicit TransportCipher(const NoiseKey &key, uint64_t initial_nonce = 0);
+    // Wipe the AES-GCM key on scope exit.
+    ~TransportCipher();
+    TransportCipher(const TransportCipher &) = delete;
+    TransportCipher &operator=(const TransportCipher &) = delete;
 
     void seal(const uint8_t *aad, size_t aad_len,
               const uint8_t *plaintext, size_t plaintext_len,
