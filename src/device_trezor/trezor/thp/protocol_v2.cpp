@@ -30,6 +30,7 @@
 #include "framing.hpp"
 #include "../exceptions.hpp"
 
+#include <cstdio>
 #include <cstring>
 
 #undef MONERO_DEFAULT_LOG_CATEGORY
@@ -109,33 +110,79 @@ namespace hw { namespace trezor { namespace thp {
     m_handshake.set_host_static_key(m_host_static);
     m_handshake.set_known_devices(m_known_devices);
 
-    // 3. host -> device: HandshakeInitiationRequest (control 0x00)
+    // Helper: read frames, dropping any unsolicited transport-error/ping
+    // frames, until we see one whose control byte matches `want_ctrl`. ACK
+    // frames addressed to the host are consumed via consume_ack() instead.
+    auto recv_specific = [&](uint8_t want_ctrl, const char *what) -> Frame {
+      while (true) {
+        Frame fr = recv_frame(transport);
+        if (fr.channel_id != m_channel.channel_id) {
+          MWARNING("THP: dropping frame on unexpected channel " << fr.channel_id);
+          continue;
+        }
+        if (fr.control_byte == want_ctrl) {
+          return fr;
+        }
+        if (fr.is_ack()) {
+          // Stray ACK before our expected response — log and keep waiting.
+          MDEBUG("THP: stray ACK while waiting for " << what);
+          continue;
+        }
+        if (fr.control_byte == CTRL_TRANSPORT_ERROR) {
+          throw exc::ProtocolException(std::string("THP: transport error during ") + what);
+        }
+        throw exc::ProtocolException(std::string("THP: unexpected frame waiting for ") + what +
+                                     " (got control 0x" +
+                                     [&]{ char b[5]; std::snprintf(b, sizeof(b), "%02x", fr.control_byte); return std::string(b); }() + ")");
+      }
+    };
+
+    auto consume_ack = [&](uint8_t want_seq, const char *what) {
+      const uint8_t want_ctrl = want_seq ? CTRL_ACK_SEQ1 : CTRL_ACK_SEQ0;
+      while (true) {
+        Frame fr = recv_frame(transport);
+        if (fr.channel_id != m_channel.channel_id) {
+          continue;
+        }
+        if (fr.control_byte == want_ctrl) {
+          return;
+        }
+        if (fr.is_ack()) {
+          // Wrong-seq ACK; ignore and keep reading.
+          MDEBUG("THP: ignoring ACK with mismatched seq while waiting for ACK after " << what);
+          continue;
+        }
+        throw exc::ProtocolException(std::string("THP: expected ACK after ") + what);
+      }
+    };
+
+    // 3. host -> device: HandshakeInitiationRequest (control 0x00, seq=0)
     auto init_req = m_handshake.build_init_request(/*try_to_unlock=*/false);
     send_frame(transport, CTRL_HANDSHAKE_INIT_REQ,
                init_req.data(), init_req.size());
+    // 3a. device ACKs the request (seq=0)
+    consume_ack(0, "HandshakeInitRequest");
 
     // 4. device -> host: HandshakeInitiationResponse (control 0x01)
-    Frame init_resp = recv_frame(transport);
-    if (init_resp.control_byte != CTRL_HANDSHAKE_INIT_RESP ||
-        init_resp.channel_id   != m_channel.channel_id) {
-      throw exc::ProtocolException("THP: unexpected init response frame");
-    }
+    Frame init_resp = recv_specific(CTRL_HANDSHAKE_INIT_RESP, "HandshakeInitResponse");
     m_handshake.consume_init_response(init_resp.payload.data(),
                                       init_resp.payload.size());
+    // 4a. host ACKs the response (seq=0)
+    send_frame(transport, CTRL_ACK_SEQ0, nullptr, 0);
 
-    // 5. host -> device: HandshakeCompletionRequest (control 0x02)
+    // 5. host -> device: HandshakeCompletionRequest (control 0x02, seq=1)
     auto comp_req = m_handshake.build_completion_request();
     send_frame(transport, CTRL_HANDSHAKE_COMP_REQ,
                comp_req.data(), comp_req.size());
+    // 5a. device ACKs (seq=1)
+    consume_ack(1, "HandshakeCompletionRequest");
 
     // 6. device -> host: HandshakeCompletionResponse (control 0x03)
-    Frame comp_resp = recv_frame(transport);
-    if (comp_resp.control_byte != CTRL_HANDSHAKE_COMP_RESP ||
-        comp_resp.channel_id   != m_channel.channel_id) {
-      throw exc::ProtocolException("THP: unexpected completion response frame");
-    }
+    Frame comp_resp = recv_specific(CTRL_HANDSHAKE_COMP_RESP, "HandshakeCompletionResponse");
     m_handshake.consume_completion_response(comp_resp.payload.data(),
                                             comp_resp.payload.size());
+    // 6a. host ACKs (seq=1)
+    send_frame(transport, CTRL_ACK_SEQ1, nullptr, 0);
 
     // 7. Build cipherstates per specification.md (encryption_state: nonce
     //    counters start at 0 for outgoing requests and 1 for incoming
