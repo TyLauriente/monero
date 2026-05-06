@@ -177,6 +177,10 @@ namespace hw { namespace trezor { namespace thp {
             throw exc::ProtocolException("THP: expected ThpEndResponse");
           }
         }
+        // Allocate the seeded application session (THP sessions.md). Without
+        // this, the first MoneroGetAddress lands on a SeedlessSessionContext
+        // and the device returns Failure(InvalidSession).
+        v2->create_app_session(transport);
         promote();
       } catch (...) {
         m_v2.reset();
@@ -216,6 +220,10 @@ namespace hw { namespace trezor { namespace thp {
         if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
           throw exc::ProtocolException("THP: expected ThpEndResponse after paired handshake");
         }
+        // Allocate the seeded application session (THP sessions.md). Without
+        // this, the first MoneroGetAddress lands on a SeedlessSessionContext
+        // and the device returns Failure(InvalidSession).
+        v2->create_app_session(transport);
         promote();
       } catch (...) {
         m_v2.reset();

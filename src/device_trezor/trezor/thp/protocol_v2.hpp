@@ -52,8 +52,9 @@ namespace hw { namespace trezor { namespace thp {
   // Lifecycle:
   //   1. set_host_static_key() / set_known_devices()  (before session_begin)
   //   2. session_begin(transport) -> alloc, handshake, [pairing]
-  //   3. write/read pairs        -> AES-GCM-sealed protobuf exchange
-  //   4. session_end(transport)
+  //   3. create_app_session(transport) -> ThpCreateNewSession -> session_id=1
+  //   4. write/read pairs        -> AES-GCM-sealed protobuf exchange
+  //   5. session_end(transport)
   class ProtocolV2 : public Protocol {
   public:
     ProtocolV2();
@@ -85,6 +86,19 @@ namespace hw { namespace trezor { namespace thp {
     void read (Transport &transport,
                std::shared_ptr<google::protobuf::Message> &msg,
                messages::MessageType *msg_type = nullptr) override;
+
+    // Per THP application-layer sessions.md: after ThpEndResponse the channel
+    // is in encrypted-transport state with only a seedless management session
+    // (session_id=0). Application traffic (Monero operations that require seed
+    // derivation) must be sent on a proper wallet session. Call this method
+    // once — after ThpEndResponse and before any application write — to send
+    // ThpCreateNewSession (wire 1000) with passphrase="" on session_id=1,
+    // receive the Success acknowledgement from the device, and store the
+    // allocated session_id for use in all subsequent write() calls.
+    //
+    // Subsequent write() calls will use m_session_id (= 1 after this call)
+    // for all messages, including the Initialize→GetFeatures translation.
+    void create_app_session(Transport &transport);
 
     // For diagnostics / pairing UX.
     uint16_t                      channel_id()             const { return m_channel.channel_id; }
@@ -122,6 +136,12 @@ namespace hw { namespace trezor { namespace thp {
     uint8_t           m_send_seq = 0;
     uint8_t           m_recv_seq = 0;
     bool              m_session_open = false;
+    // THP application session identifier. 0x00 is the seedless management
+    // session used for pairing-context and management messages only.
+    // create_app_session() promotes this to 0x01, after which write() embeds
+    // it in every encrypted plaintext header so the device routes the message
+    // to the correct passphrase-derived wallet session.
+    uint8_t           m_session_id = 0x00;
   };
 
 }}}
