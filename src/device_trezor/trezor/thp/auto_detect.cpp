@@ -212,7 +212,37 @@ namespace hw { namespace trezor { namespace thp {
             "have been swapped. Re-pair the device by clearing "
             ".trezor/thp_store.bin in the wallet directory.");
       }
-      promote();
+      // Per THP spec (states TC1 / HC0): after HandshakeCompletionResponse with
+      // STATE_PAIRED, the device is in the *credential phase* (TC1) and only
+      // accepts ThpCredentialRequest or ThpEndRequest. We must send ThpEndRequest
+      // to transition the device to the transport state before any application
+      // traffic; otherwise the device returns "Message unrecognized in pairing
+      // context" for the first GetFeatures / MoneroGetAddress / etc. The
+      // unpaired branch above already does this implicitly via the credential
+      // round-trip; this branch reuses an existing credential and so must
+      // emit a bare ThpEndRequest of its own.
+      m_v2 = v2;
+      try {
+        messages::thp::ThpEndRequest end_req;
+        v2->write(transport, end_req);
+        std::shared_ptr<google::protobuf::Message> end_resp;
+        messages::MessageType msg_type;
+        v2->read(transport, end_resp, &msg_type);
+        if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(end_resp)) {
+          throw exc::proto::FailureException(
+              fail->has_code() ? boost::optional<uint32_t>(fail->code())
+                               : boost::optional<uint32_t>(),
+              fail->has_message() ? boost::optional<std::string>(fail->message())
+                                  : boost::optional<std::string>());
+        }
+        if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
+          throw exc::ProtocolException("THP: expected ThpEndResponse after paired handshake");
+        }
+        promote();
+      } catch (...) {
+        m_v2.reset();
+        throw;
+      }
     } else {
       throw exc::ProtocolException(
           "THP: device returned unknown state byte (got " +
