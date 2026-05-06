@@ -62,6 +62,12 @@ namespace trezor
   }
 
   google::protobuf::Message * MessageMapper::get_message(messages::MessageType wire_number) {
+    // ThpCreateNewSession is reserved (no enum name) in both MessageType
+    // and ThpMessageType. Construct it directly to avoid the descriptor
+    // lookup falling through to "Message descriptor not found".
+    if (static_cast<int>(wire_number) == 1000) {
+      return new hw::trezor::messages::thp::ThpCreateNewSession();
+    }
     string messageTypeName = hw::trezor::messages::MessageType_Name(wire_number);
     string messageName;
     if (!messageTypeName.empty()) {
@@ -149,6 +155,19 @@ namespace trezor
     hw::trezor::messages::thp::ThpMessageType thp_res;
     if (hw::trezor::messages::thp::ThpMessageType_Parse(thpEnumName, &thp_res)) {
       return static_cast<messages::MessageType>(thp_res);
+    }
+
+    // ThpCreateNewSession lives at wire-type 1000, which is `reserved 1000`
+    // in both the master MessageType enum (messages.proto) and the
+    // ThpMessageType enum (messages-thp.proto) in this fork's vendored
+    // protobufs — neither enum has a parseable named entry for it, so
+    // both Parse calls above fail. The protobuf message class is still
+    // generated (messages-thp.pb.h) and the device firmware accepts wire
+    // 1000 for ThpCreateNewSession. Hard-code the mapping so the THP host
+    // can allocate a seeded application session without regenerating
+    // upstream protobufs.
+    if (msg_name == "ThpCreateNewSession") {
+      return static_cast<messages::MessageType>(1000);
     }
 
     throw exc::EncodingException(std::string("Message ") + msg_name + " not found");

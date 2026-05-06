@@ -51,10 +51,13 @@ namespace hw { namespace trezor { namespace thp {
   //
   // Lifecycle:
   //   1. set_host_static_key() / set_known_devices()  (before session_begin)
-  //   2. session_begin(transport) -> alloc, handshake, [pairing]
-  //   3. create_app_session(transport) -> ThpCreateNewSession -> session_id=1
-  //   4. write/read pairs        -> AES-GCM-sealed protobuf exchange
-  //   5. session_end(transport)
+  //   2. session_begin(transport) -> alloc, handshake
+  //   3. caller drives pairing FSM (if unpaired) and ThpEndRequest exchange
+  //      using write/read on the implicit session 0 (pairing/credential phase)
+  //   4. caller calls set_session_id(1), sends ThpCreateNewSession via write,
+  //      reads Success — promotes the channel to a seeded application session
+  //   5. write/read pairs        -> AES-GCM-sealed protobuf exchange on sid=1
+  //   6. session_end(transport)
   class ProtocolV2 : public Protocol {
   public:
     ProtocolV2();
@@ -88,17 +91,17 @@ namespace hw { namespace trezor { namespace thp {
                messages::MessageType *msg_type = nullptr) override;
 
     // Per THP application-layer sessions.md: after ThpEndResponse the channel
-    // is in encrypted-transport state with only a seedless management session
-    // (session_id=0). Application traffic (Monero operations that require seed
-    // derivation) must be sent on a proper wallet session. Call this method
-    // once — after ThpEndResponse and before any application write — to send
-    // ThpCreateNewSession (wire 1000) with passphrase="" on session_id=1,
-    // receive the Success acknowledgement from the device, and store the
-    // allocated session_id for use in all subsequent write() calls.
-    //
-    // Subsequent write() calls will use m_session_id (= 1 after this call)
-    // for all messages, including the Initialize→GetFeatures translation.
-    void create_app_session(Transport &transport);
+    // is in encrypted-transport state with only an implicit seedless management
+    // session at session_id=0. Application traffic that needs seed derivation
+    // must be sent on a session allocated via ThpCreateNewSession. The
+    // session_id is the byte the host writes into the encrypted-transport
+    // plaintext header (struct ">BH": session_id, msg_type). Callers (auto-
+    // detect) flip this from 0 to 1 after the ThpEndRequest exchange and
+    // before sending ThpCreateNewSession itself, so that the firmware's
+    // SeedlessSessionContext for session_id=1 is the one that runs the
+    // ThpCreateNewSession handler.
+    void set_session_id(uint8_t sid) { m_session_id = sid; }
+    uint8_t session_id() const { return m_session_id; }
 
     // For diagnostics / pairing UX.
     uint16_t                      channel_id()             const { return m_channel.channel_id; }

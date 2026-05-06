@@ -29,8 +29,6 @@
 #include "protocol_v2.hpp"
 #include "framing.hpp"
 #include "../exceptions.hpp"
-#include "../messages/messages-thp.pb.h"
-#include "../messages/messages-common.pb.h"
 
 #include <cstdio>
 #include <cstring>
@@ -362,63 +360,6 @@ namespace hw { namespace trezor { namespace thp {
     const uint8_t ack_ctrl = m_recv_seq ? CTRL_ACK_SEQ1 : CTRL_ACK_SEQ0;
     send_frame(transport, ack_ctrl, nullptr, 0);
     m_recv_seq ^= 1;
-  }
-
-  void ProtocolV2::create_app_session(Transport &transport)
-  {
-    // Per THP application-layer sessions.md and trezorlib.thp.client._get_session,
-    // application-layer messages that need seed-derived state (MoneroGetAddress
-    // and friends) must run on a session that the host has explicitly allocated
-    // via ThpCreateNewSession. Sending such a message on an un-allocated
-    // session_id (including 0) puts it into a SeedlessSessionContext on the
-    // device whose .cache property raises InvalidSessionError, which the
-    // firmware translates to Failure(code=14, "Invalid session").
-    //
-    // The host advances m_session_id to a fresh value (1) and sends
-    // ThpCreateNewSession on that session_id with passphrase="" (Monero does
-    // not use Trezor passphrases — STANDARD_WALLET in trezorlib terms). The
-    // device handler runs in the seedless context for session_id=1, calls
-    // get_new_session_context which marks the session_cache as ALLOCATED,
-    // then derives and stores the seed root keys, and replies Success.
-    //
-    // Subsequent messages routed back through _handle_state_ENCRYPTED_TRANSPORT
-    // re-resolve the session via cache lookup (after the firmware's per-message
-    // micropython-machine restart clears the in-memory channel.sessions dict),
-    // returning a real SessionContext with seed access.
-    constexpr uint8_t APP_SESSION_ID = 0x01;
-
-    if (!m_session_open || !m_send_cipher || !m_recv_cipher) {
-      throw exc::ProtocolException("THP: create_app_session before session_begin");
-    }
-    if (m_session_id != 0) {
-      // already promoted; idempotent.
-      return;
-    }
-
-    m_session_id = APP_SESSION_ID;
-
-    messages::thp::ThpCreateNewSession req;
-    req.set_passphrase("");           // STANDARD_WALLET (no passphrase)
-    req.set_derive_cardano(false);
-    write(transport, req);
-
-    std::shared_ptr<google::protobuf::Message> resp;
-    messages::MessageType mt;
-    read(transport, resp, &mt);
-    if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(resp)) {
-      m_session_id = 0;
-      throw exc::proto::FailureException(
-          fail->has_code() ? boost::optional<uint32_t>(fail->code())
-                           : boost::optional<uint32_t>(),
-          fail->has_message() ? boost::optional<std::string>(fail->message())
-                              : boost::optional<std::string>("THP: ThpCreateNewSession failed"));
-    }
-    if (!std::dynamic_pointer_cast<messages::common::Success>(resp)) {
-      m_session_id = 0;
-      throw exc::ProtocolException(
-          "THP: expected Success after ThpCreateNewSession");
-    }
-    MINFO("THP: app session " << int(APP_SESSION_ID) << " created on channel " << m_channel.channel_id);
   }
 
 }}}

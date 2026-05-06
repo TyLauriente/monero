@@ -112,6 +112,25 @@ namespace hw { namespace trezor { namespace thp {
     std::shared_ptr<google::protobuf::Message>
     read_handling_buttons(Transport &transport, const char *expected);
 
+    // Run the post-handshake bring-up sequence that promotes the channel
+    // from TC1 (credential phase) to a seeded application session ready
+    // for Monero traffic:
+    //
+    //   1. Send ThpEndRequest on session 0 -> read ThpEndResponse (handles
+    //      ButtonRequest if the firmware prompts the user to confirm the
+    //      reconnection for non-autoconnect credentials).
+    //   2. Bump m_v2->set_session_id(1) so the next encrypted-transport
+    //      plaintext header carries session_id=1.
+    //   3. Send ThpCreateNewSession(passphrase="", derive_cardano=false)
+    //      -> read Success (handles ButtonRequest from the firmware's
+    //      lock_manager.unlock_device PIN-prompt step inside
+    //      handle_ThpCreateNewSession).
+    //
+    // After this, ProtocolV2::write embeds session_id=1 in every encrypted
+    // plaintext header so the device routes the message to the seeded
+    // SessionContext for that session_id.
+    void thp_end_then_create_app_session(Transport &transport);
+
     ProtocolConfig                        m_config;
     std::shared_ptr<Protocol>             m_actual;     // v1 or v2 once selected
     std::shared_ptr<ProtocolV2>           m_v2;         // shortcut typed alias

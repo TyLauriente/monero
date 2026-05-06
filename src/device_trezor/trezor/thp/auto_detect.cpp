@@ -139,6 +139,9 @@ namespace hw { namespace trezor { namespace thp {
       try {
         run_code_entry_pairing(transport);
 
+        // Optional credential round-trip on TC1 — only if we have a store to
+        // persist the credential to. Without persistence, requesting a
+        // credential is pointless (we'd lose it on shutdown).
         if (have_store_path) {
           const auto &hs = v2->host_static();
           messages::thp::ThpCredentialRequest creq;
@@ -168,19 +171,14 @@ namespace hw { namespace trezor { namespace thp {
           kd.pairing_credential.assign(cred.begin(), cred.end());
           store.upsert_known_device(kd);
           store.save(m_config.store_path);
-
-          // Send ThpEndRequest to leave the credential phase.
-          messages::thp::ThpEndRequest end_req;
-          v2->write(transport, end_req);
-          auto end_resp = read_handling_buttons(transport, "ThpEndResponse");
-          if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
-            throw exc::ProtocolException("THP: expected ThpEndResponse");
-          }
         }
-        // Allocate the seeded application session (THP sessions.md). Without
-        // this, the first MoneroGetAddress lands on a SeedlessSessionContext
-        // and the device returns Failure(InvalidSession).
-        v2->create_app_session(transport);
+
+        // Always send ThpEndRequest after pairing completes — regardless of
+        // whether we requested a credential — to transition the device out
+        // of the TC1 (credential phase) and into the encrypted-transport
+        // state. Without this, the next message lands in TC1 and is rejected
+        // as "Message unrecognized in pairing context".
+        thp_end_then_create_app_session(transport);
         promote();
       } catch (...) {
         m_v2.reset();
@@ -210,20 +208,7 @@ namespace hw { namespace trezor { namespace thp {
       // emit a bare ThpEndRequest of its own.
       m_v2 = v2;
       try {
-        // Per spec: STATE_PAIRED handshake completion may be followed by
-        // a ButtonRequest asking the user to confirm the reconnection
-        // (autoconnect=false credentials). read_handling_buttons ACKs
-        // those transparently and returns the next non-button message.
-        messages::thp::ThpEndRequest end_req;
-        v2->write(transport, end_req);
-        auto end_resp = read_handling_buttons(transport, "ThpEndResponse");
-        if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
-          throw exc::ProtocolException("THP: expected ThpEndResponse after paired handshake");
-        }
-        // Allocate the seeded application session (THP sessions.md). Without
-        // this, the first MoneroGetAddress lands on a SeedlessSessionContext
-        // and the device returns Failure(InvalidSession).
-        v2->create_app_session(transport);
+        thp_end_then_create_app_session(transport);
         promote();
       } catch (...) {
         m_v2.reset();
@@ -234,6 +219,55 @@ namespace hw { namespace trezor { namespace thp {
           "THP: device returned unknown state byte (got " +
           std::to_string(int(v2->trezor_state())) + ")");
     }
+  }
+
+  void ProtocolAutoDetect::thp_end_then_create_app_session(Transport &transport)
+  {
+    if (!m_v2) {
+      throw exc::ProtocolException("THP: thp_end_then_create_app_session without ProtocolV2");
+    }
+
+    // Phase 1: leave TC1 (credential phase) -> ENCRYPTED_TRANSPORT.
+    // The device may emit a ButtonRequest asking the user to confirm the
+    // reconnection (non-autoconnect credentials); read_handling_buttons
+    // ACKs it transparently.
+    {
+      messages::thp::ThpEndRequest end_req;
+      m_v2->write(transport, end_req);
+      auto end_resp = read_handling_buttons(transport, "ThpEndResponse");
+      if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
+        throw exc::ProtocolException("THP: expected ThpEndResponse");
+      }
+    }
+
+    // Phase 2: allocate a seeded application session. Without this, the
+    // device routes app traffic to a SeedlessSessionContext whose .cache
+    // raises InvalidSessionError, which firmware translates to
+    // Failure(code=14, "Invalid session"). The host picks session_id=1;
+    // the device's handle_ThpCreateNewSession (apps/base.py) then runs
+    // lock_manager.unlock_device (PIN unlock if locked, may emit
+    // ButtonRequest), derive_and_store_roots, and replies Success.
+    constexpr uint8_t APP_SESSION_ID = 0x01;
+    m_v2->set_session_id(APP_SESSION_ID);
+
+    messages::thp::ThpCreateNewSession sess_req;
+    sess_req.set_passphrase("");          // STANDARD_WALLET (no Trezor passphrase)
+    sess_req.set_derive_cardano(false);
+    try {
+      m_v2->write(transport, sess_req);
+      auto sess_resp = read_handling_buttons(transport, "Success after ThpCreateNewSession");
+      if (!std::dynamic_pointer_cast<messages::common::Success>(sess_resp)) {
+        throw exc::ProtocolException("THP: expected Success after ThpCreateNewSession");
+      }
+    } catch (...) {
+      // Roll the session_id back so a retry starts from the management
+      // session and doesn't accidentally reuse a half-allocated id.
+      m_v2->set_session_id(0);
+      throw;
+    }
+
+    MINFO("THP: app session " << int(APP_SESSION_ID)
+          << " allocated on channel " << m_v2->channel_id());
   }
 
   std::shared_ptr<google::protobuf::Message>
