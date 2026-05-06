@@ -411,10 +411,22 @@ namespace hw { namespace trezor { namespace thp {
 
     // Identify whether this device is paired (HH1 step 11). The lookup is
     // O(known) per spec; for typical use (a few prior Trezors) this is fine.
+    //
+    // The masked static pubkey rotates each session (it's
+    //   X25519(SHA-256(static_pub || trezor_eph_pub), static_pub)
+    // where trezor_eph_pub is FRESHLY generated each connect), so we cannot
+    // simply compare against a stored masked value. Per spec, we recompute
+    // the mask using the *current* session's trezor_ephemeral_pub for each
+    // stored unmasked static, and compare to the just-decrypted masked
+    // value.
     m_paired = false;
     m_pairing_credential.clear();
     for (const auto &kd : m_known_devices) {
-      if (sodium_memcmp(kd.trezor_masked_static_pubkey.data(),
+      NoisePubKey expected_masked{};
+      crypto::trezor_mask_static(kd.trezor_static_pubkey,
+                                 m_trezor_ephemeral_pub,
+                                 expected_masked);
+      if (sodium_memcmp(expected_masked.data(),
                         m_trezor_masked_static.data(),
                         NOISE_DHLEN) == 0)
       {

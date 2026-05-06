@@ -201,6 +201,13 @@ namespace hw { namespace trezor { namespace thp {
 
     MINFO("THP: handshake complete on channel " << m_channel.channel_id);
 
+    // If consume_init_response matched a previously-paired device, the
+    // handshake's internal host_static was swapped to the credential
+    // we'd persisted for that device. Pull that authoritative copy back
+    // up so host_static() returns the correct keypair for the duration
+    // of this session.
+    m_host_static = m_handshake.host_static_in_use();
+
     // 7. Build cipherstates per specification.md (encryption_state: nonce
     //    counters start at 0 for outgoing requests and 1 for incoming
     //    responses, since the HandshakeCompletionResponse already consumed

@@ -61,12 +61,16 @@ namespace hw { namespace trezor { namespace thp {
     NoisePrivKey priv{};
   };
 
-  // A previously-established pairing: the masked Trezor static pubkey
+  // A previously-established pairing: the *unmasked* Trezor static pubkey
   // observed during an earlier handshake, the host static keypair that
   // was used with that device, and the opaque pairing credential issued
   // by Trezor in the credential phase.
+  //
+  // The masked form rotates per session (it depends on the device's fresh
+  // ephemeral pubkey), so we must persist the unmasked pubkey and re-mask
+  // each session before comparing — see specification.md HH1 step 11.
   struct KnownDevice {
-    NoisePubKey   trezor_masked_static_pubkey{};
+    NoisePubKey   trezor_static_pubkey{};
     HostStaticKey host_static{};
     std::vector<uint8_t> pairing_credential; // opaque to the host
   };
@@ -198,6 +202,13 @@ namespace hw { namespace trezor { namespace thp {
 
     bool is_complete() const { return m_complete; }
     const HandshakeKeys &keys() const;
+
+    // The host static keypair actually in use after consume_init_response.
+    // For the unpaired flow this is whatever set_host_static_key(...)
+    // received. For the paired flow this is the keypair pulled from the
+    // matching KnownDevice entry — the caller's outer copy is now stale
+    // and should be re-synced from this accessor.
+    const HostStaticKey &host_static_in_use() const { return m_host_static; }
 
   private:
     // Symmetric-state primitives, used per the spec to mix the running

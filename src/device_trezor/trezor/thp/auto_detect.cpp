@@ -77,12 +77,18 @@ namespace hw { namespace trezor { namespace thp {
     // Probe the device by attempting a THP channel allocation.  If the
     // device is THP-only (Safe 7) this succeeds in milliseconds; if the
     // device is V1 (Model T / Safe 3 / Safe 5) it ignores the unknown
-    // packet, the read times out, and probe_thp throws.
+    // packet, the read times out, and probe_thp throws TimeoutException.
+    //
+    // We deliberately catch *only* TimeoutException to fall back to V1.
+    // Other failures (libusb stalls, encoding errors, security failures)
+    // signal a real problem and must propagate, otherwise the user sees
+    // a confusing "V1 failure" on a Safe 7 that actually has a
+    // communication issue.
     AllocatedChannel allocation;
     try {
       allocation = probe_thp(transport);
-    } catch (const std::exception &e) {
-      MDEBUG("THP probe failed (" << e.what() << "); falling back to ProtocolV1");
+    } catch (const exc::TimeoutException &e) {
+      MDEBUG("THP probe timed out (" << e.what() << "); falling back to ProtocolV1");
       m_actual   = std::make_shared<ProtocolV1>();
       m_selected = "v1";
       return;
@@ -106,19 +112,35 @@ namespace hw { namespace trezor { namespace thp {
     v2->adopt_allocation(allocation);
     v2->session_begin(transport);
 
-    // If the device reports STATE_UNPAIRED and we have a pairing prompt,
-    // run the CodeEntry FSM and persist the resulting credential.
-    if (v2->trezor_state() == STATE_UNPAIRED && m_config.pairing_prompt) {
-      m_v2 = v2; // run_code_entry_pairing reads m_v2
-      m_actual = v2;
+    // We do NOT promote `v2` to `m_actual` until the full unpaired-or-paired
+    // routing decision is made and any pairing FSM has succeeded. If
+    // session_begin() succeeded but pairing then throws, m_actual must
+    // remain null so the next session_begin() retries from scratch
+    // rather than short-circuiting on the cached partial state.
+    auto promote = [&]() {
+      m_actual   = v2;
       m_selected = "v2";
-      run_code_entry_pairing(transport);
+    };
+
+    if (v2->trezor_state() == STATE_UNPAIRED) {
+      if (!m_config.pairing_prompt) {
+        // STATE_UNPAIRED with no prompt configured: fail closed; the
+        // application traffic phase isn't trustworthy without pairing.
+        throw exc::SecurityException(
+            "THP: device is unpaired and no pairing prompt is configured "
+            "(set ProtocolConfig::pairing_prompt before session_begin)");
+      }
+      // Make m_v2 visible to run_code_entry_pairing; clear it on any
+      // failure so the next reconnect starts clean.
+      m_v2 = v2;
+      try {
+        run_code_entry_pairing(transport);
+      } catch (...) {
+        m_v2.reset();
+        throw;
+      }
 
       if (have_store_path) {
-        // After pairing, request a long-lived credential and persist it.
-        // We request the credential then leave the credential phase via
-        // ThpEndRequest -> ThpEndResponse.  Both messages are routed
-        // through the existing v2 cipherstates.
         const auto &hs = v2->host_static();
         messages::thp::ThpCredentialRequest creq;
         creq.set_host_static_public_key(reinterpret_cast<const char *>(hs.pub.data()),
@@ -129,13 +151,29 @@ namespace hw { namespace trezor { namespace thp {
         messages::MessageType msg_type;
         v2->read(transport, resp_msg, &msg_type);
         auto cresp = std::dynamic_pointer_cast<messages::thp::ThpCredentialResponse>(resp_msg);
+        if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(resp_msg)) {
+          throw exc::proto::FailureException(
+              fail->has_code() ? boost::optional<uint32_t>(fail->code())
+                               : boost::optional<uint32_t>(),
+              fail->has_message() ? boost::optional<std::string>(fail->message())
+                                  : boost::optional<std::string>());
+        }
         if (!cresp) {
           throw exc::ProtocolException("THP: expected ThpCredentialResponse");
         }
 
+        // ThpCredentialResponse delivers the device's *unmasked* static
+        // pubkey alongside the credential — that's how we recover it
+        // (the InitResponse only carries the masked form). We store the
+        // unmasked form so subsequent sessions can recompute the mask
+        // against each session's fresh device ephemeral pubkey.
+        const std::string &dev_static = cresp->trezor_static_public_key();
+        if (dev_static.size() != 32) {
+          throw exc::ProtocolException("THP: ThpCredentialResponse: bad trezor_static_public_key size");
+        }
         KnownDevice kd;
-        kd.trezor_masked_static_pubkey = v2->trezor_masked_static();
-        kd.host_static                 = hs;
+        std::memcpy(kd.trezor_static_pubkey.data(), dev_static.data(), 32);
+        kd.host_static = hs;
         const std::string &cred = cresp->credential();
         kd.pairing_credential.assign(cred.begin(), cred.end());
         store.upsert_known_device(kd);
@@ -146,18 +184,36 @@ namespace hw { namespace trezor { namespace thp {
         v2->write(transport, end_req);
         std::shared_ptr<google::protobuf::Message> end_resp;
         v2->read(transport, end_resp, &msg_type);
+        if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(end_resp)) {
+          throw exc::proto::FailureException(
+              fail->has_code() ? boost::optional<uint32_t>(fail->code())
+                               : boost::optional<uint32_t>(),
+              fail->has_message() ? boost::optional<std::string>(fail->message())
+                                  : boost::optional<std::string>());
+        }
+        if (!std::dynamic_pointer_cast<messages::thp::ThpEndResponse>(end_resp)) {
+          throw exc::ProtocolException("THP: expected ThpEndResponse");
+        }
       }
+      promote();
     } else if (v2->trezor_state() == STATE_PAIRED ||
                v2->trezor_state() == STATE_PAIRED_AUTOCONNECT) {
-      // Recognised paired device — proceed straight to the transport phase.
-      m_actual   = v2;
-      m_selected = "v2";
+      // The device claims a paired session. Trust it only if our store
+      // contains a matching unmasked static pubkey (TOFU). A device that
+      // reports paired status without a store entry is either a fresh
+      // device we somehow lost the credential for, or an attempted spoof.
+      if (!v2->is_known_device()) {
+        throw exc::SecurityException(
+            "THP: device claims paired status but is not in our known-devices "
+            "list. The pairing store may have been deleted or the device may "
+            "have been swapped. Re-pair the device by clearing "
+            ".trezor/thp_store.bin in the wallet directory.");
+      }
+      promote();
     } else {
-      // STATE_UNPAIRED with no prompt configured: fail closed; the
-      // application traffic phase isn't trustworthy without pairing.
-      throw exc::SecurityException(
-          "THP: device is unpaired and no pairing prompt is configured "
-          "(set ProtocolConfig::pairing_prompt before session_begin)");
+      throw exc::ProtocolException(
+          "THP: device returned unknown state byte (got " +
+          std::to_string(int(v2->trezor_state())) + ")");
     }
   }
 
@@ -166,35 +222,44 @@ namespace hw { namespace trezor { namespace thp {
     if (!m_v2) {
       throw exc::ProtocolException("THP: pairing without ProtocolV2");
     }
-    // 1. Send ThpPairingRequest(host_name, app_name).
+
+    // Read the next message, transparently ack'ing ButtonRequest, and
+    // surface common::Failure as a typed FailureException. `expected`
+    // names the message we're waiting for, used in the diagnostic if an
+    // unrelated message arrives.
+    auto read_handling_buttons = [&](const char *expected) {
+      std::shared_ptr<google::protobuf::Message> msg;
+      messages::MessageType mt;
+      while (true) {
+        m_v2->read(transport, msg, &mt);
+        if (std::dynamic_pointer_cast<messages::common::ButtonRequest>(msg)) {
+          messages::common::ButtonAck ack;
+          m_v2->write(transport, ack);
+          continue;
+        }
+        if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(msg)) {
+          throw exc::proto::FailureException(
+              fail->has_code() ? boost::optional<uint32_t>(fail->code())
+                               : boost::optional<uint32_t>(),
+              fail->has_message() ? boost::optional<std::string>(fail->message())
+                                  : boost::optional<std::string>(
+                                      std::string("THP pairing failed while waiting for ") + expected));
+        }
+        return msg;
+      }
+    };
+
+    // 1. Send ThpPairingRequest(host_name, app_name) and wait for
+    //    ThpPairingRequestApproved.
     messages::thp::ThpPairingRequest preq;
     preq.set_host_name(m_config.host_name);
     preq.set_app_name(m_config.app_name);
     m_v2->write(transport, preq);
-
-    std::shared_ptr<google::protobuf::Message> msg;
-    messages::MessageType mt;
-
-    // Expect ThpPairingRequestApproved (possibly preceded by ButtonRequest
-    // — the host is required to ack ButtonRequests with ButtonAck).
-    while (true) {
-      m_v2->read(transport, msg, &mt);
-      if (auto br = std::dynamic_pointer_cast<messages::common::ButtonRequest>(msg)) {
-        messages::common::ButtonAck ack;
-        m_v2->write(transport, ack);
-        continue;
+    {
+      auto msg = read_handling_buttons("ThpPairingRequestApproved");
+      if (!std::dynamic_pointer_cast<messages::thp::ThpPairingRequestApproved>(msg)) {
+        throw exc::ProtocolException("THP pairing: unexpected message after PairingRequest");
       }
-      if (std::dynamic_pointer_cast<messages::thp::ThpPairingRequestApproved>(msg)) {
-        break;
-      }
-      if (auto fail = std::dynamic_pointer_cast<messages::common::Failure>(msg)) {
-        throw exc::proto::FailureException(
-            fail->has_code() ? boost::optional<uint32_t>(fail->code())
-                             : boost::optional<uint32_t>(),
-            fail->has_message() ? boost::optional<std::string>(fail->message())
-                                : boost::optional<std::string>());
-      }
-      throw exc::ProtocolException("THP pairing: unexpected message after PairingRequest");
     }
 
     // 2. Send ThpSelectMethod(CodeEntry).
@@ -204,71 +269,57 @@ namespace hw { namespace trezor { namespace thp {
 
     // 3. Receive ThpCodeEntryCommitment, send ThpCodeEntryChallenge.
     CodeEntryPairing pairing(m_v2->handshake_hash());
-    while (true) {
-      m_v2->read(transport, msg, &mt);
-      if (std::dynamic_pointer_cast<messages::common::ButtonRequest>(msg)) {
-        messages::common::ButtonAck ack;
-        m_v2->write(transport, ack);
-        continue;
-      }
-      if (auto cmt = std::dynamic_pointer_cast<messages::thp::ThpCodeEntryCommitment>(msg)) {
-        const std::string &c = cmt->commitment();
-        pairing.consume_commitment_build_challenge(
-            reinterpret_cast<const uint8_t *>(c.data()), c.size());
-        messages::thp::ThpCodeEntryChallenge ch;
-        ch.set_challenge(reinterpret_cast<const char *>(pairing.challenge().data()),
-                         pairing.challenge().size());
-        m_v2->write(transport, ch);
-        break;
-      }
-      throw exc::ProtocolException("THP pairing: expected ThpCodeEntryCommitment");
+    {
+      auto msg = read_handling_buttons("ThpCodeEntryCommitment");
+      auto cmt = std::dynamic_pointer_cast<messages::thp::ThpCodeEntryCommitment>(msg);
+      if (!cmt) throw exc::ProtocolException("THP pairing: expected ThpCodeEntryCommitment");
+      const std::string &c = cmt->commitment();
+      pairing.consume_commitment_build_challenge(
+          reinterpret_cast<const uint8_t *>(c.data()), c.size());
+      messages::thp::ThpCodeEntryChallenge ch;
+      ch.set_challenge(reinterpret_cast<const char *>(pairing.challenge().data()),
+                       pairing.challenge().size());
+      m_v2->write(transport, ch);
     }
 
     // 4. Receive ThpCodeEntryCpaceTrezor.
-    while (true) {
-      m_v2->read(transport, msg, &mt);
-      if (std::dynamic_pointer_cast<messages::common::ButtonRequest>(msg)) {
-        messages::common::ButtonAck ack;
-        m_v2->write(transport, ack);
-        continue;
-      }
-      if (auto ct = std::dynamic_pointer_cast<messages::thp::ThpCodeEntryCpaceTrezor>(msg)) {
-        const std::string &k = ct->cpace_trezor_public_key();
-        pairing.consume_cpace_trezor(reinterpret_cast<const uint8_t *>(k.data()), k.size());
-        break;
-      }
-      throw exc::ProtocolException("THP pairing: expected ThpCodeEntryCpaceTrezor");
+    {
+      auto msg = read_handling_buttons("ThpCodeEntryCpaceTrezor");
+      auto ct = std::dynamic_pointer_cast<messages::thp::ThpCodeEntryCpaceTrezor>(msg);
+      if (!ct) throw exc::ProtocolException("THP pairing: expected ThpCodeEntryCpaceTrezor");
+      const std::string &k = ct->cpace_trezor_public_key();
+      pairing.consume_cpace_trezor(reinterpret_cast<const uint8_t *>(k.data()), k.size());
     }
 
     // 5. Prompt the user for the code, send ThpCodeEntryCpaceHostTag.
+    //    An empty return value from the prompt is treated as a user
+    //    cancellation — clearer error than feeding empty into the
+    //    derivation and getting a CPace tag mismatch.
     std::string code = m_config.pairing_prompt();
+    if (code.empty()) {
+      throw exc::SecurityException("THP pairing: cancelled by user");
+    }
     messages::thp::ThpCodeEntryCpaceHostTag tag_msg;
     auto host_tag_payload = pairing.build_host_tag(code);
-    // build_host_tag returns a raw protobuf-encoded blob; we re-decode it
-    // through the actual protobuf library to match the ProtocolV2.write
-    // path, which expects a Message instance.
     if (!tag_msg.ParseFromArray(host_tag_payload.data(), host_tag_payload.size())) {
       throw exc::EncodingException("THP pairing: failed to re-parse host tag");
     }
     m_v2->write(transport, tag_msg);
 
-    // 6. Receive ThpCodeEntrySecret, verify.
-    while (true) {
-      m_v2->read(transport, msg, &mt);
-      if (std::dynamic_pointer_cast<messages::common::ButtonRequest>(msg)) {
-        messages::common::ButtonAck ack;
-        m_v2->write(transport, ack);
-        continue;
+    // 6. Receive ThpCodeEntrySecret, verify. If the user typed a wrong
+    //    code, Trezor's CPace tag check fails and the device returns
+    //    Failure rather than ThpCodeEntrySecret — read_handling_buttons
+    //    throws FailureException, which the GUI surfaces as "wrong code,
+    //    try again".
+    {
+      auto msg = read_handling_buttons("ThpCodeEntrySecret");
+      auto sec = std::dynamic_pointer_cast<messages::thp::ThpCodeEntrySecret>(msg);
+      if (!sec) throw exc::ProtocolException("THP pairing: expected ThpCodeEntrySecret");
+      const std::string &s = sec->secret();
+      if (!pairing.consume_secret(reinterpret_cast<const uint8_t *>(s.data()), s.size())) {
+        throw exc::SecurityException(
+            "THP pairing: code mismatch (commitment / SHA-256 verification failed)");
       }
-      if (auto sec = std::dynamic_pointer_cast<messages::thp::ThpCodeEntrySecret>(msg)) {
-        const std::string &s = sec->secret();
-        if (!pairing.consume_secret(reinterpret_cast<const uint8_t *>(s.data()), s.size())) {
-          throw exc::SecurityException(
-              "THP pairing: code mismatch (commitment / SHA-256 verification failed)");
-        }
-        break;
-      }
-      throw exc::ProtocolException("THP pairing: expected ThpCodeEntrySecret");
     }
 
     MINFO("THP CodeEntry pairing succeeded");
