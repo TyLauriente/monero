@@ -103,7 +103,7 @@ namespace hw { namespace trezor { namespace thp {
   //
   // Output layout (concatenated):
   //   chunk_0 = ctrl || cid_be || len_be || payload[0..min(59,len)]      -> padded to chunk_size
-  //   chunk_1 = (ctrl|0x80) || cid_be || payload[59..min(59+61,len)]     -> padded to chunk_size
+  //   chunk_1 = 0x80 || cid_be || payload[59..min(59+61,len)]            -> padded to chunk_size
   //   ...
   // where len includes the appended CRC-32.
   //

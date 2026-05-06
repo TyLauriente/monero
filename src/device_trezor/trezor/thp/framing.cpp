@@ -100,7 +100,9 @@ namespace hw { namespace trezor { namespace thp {
         write_be16(p + 3, static_cast<uint16_t>(length_field));
         std::memcpy(p + INITIATION_HEADER_BYTES, body.data() + offset, take);
       } else {
-        p[0] = control_byte | CTRL_CONTINUATION_BIT;
+        // Per THP spec: continuation packet control byte is exactly 0x80;
+        // the low 7 bits are reserved and must be zero on transmit.
+        p[0] = CTRL_CONTINUATION_BIT;
         write_be16(p + 1, channel_id);
         std::memcpy(p + CONTINUATION_HEADER_BYTES, body.data() + offset, take);
       }

@@ -133,6 +133,30 @@ TEST(thp_framing, round_trip_multi_chunk)
   EXPECT_EQ(0, std::memcmp(f.payload.data(), payload.data(), payload.size()));
 }
 
+TEST(thp_framing, continuation_byte_is_exactly_0x80)
+{
+  // Per THP spec (docs/common/thp/specification.md), the control byte of
+  // a continuation packet is exactly 0x80 — bit 7 set, all other bits
+  // zero. Earlier we incorrectly emitted (initiation_ctrl | 0x80), which
+  // bled the message-type and seq bits into the continuation header and
+  // would be rejected by a strict device parser.
+  //
+  // Use an initiation control byte with non-zero low bits (encrypted
+  // transport with seq=1: 0x0C) and a payload large enough to span at
+  // least three USB chunks. Then assert that every continuation chunk
+  // carries control byte 0x80, regardless of the initiation control.
+  std::vector<uint8_t> payload(180, 0xCD);
+  auto wire = encode_frame(0x0C /*encrypted, seq=1*/, 0x0042,
+                           payload.data(), payload.size());
+  ASSERT_GE(wire.size(), USB_CHUNK_SIZE * 3);
+  EXPECT_EQ(0x0C, wire[0]);  // initiation chunk: original ctrl
+  for (size_t off = USB_CHUNK_SIZE; off < wire.size(); off += USB_CHUNK_SIZE) {
+    EXPECT_EQ(0x80, wire[off]) << "continuation chunk at offset " << off
+        << " has wrong control byte (must be 0x80, got 0x"
+        << std::hex << int(wire[off]) << std::dec << ")";
+  }
+}
+
 TEST(thp_framing, round_trip_chunk_boundary)
 {
   // A 59-byte payload exactly fills the first chunk's 64-byte capacity
@@ -606,6 +630,87 @@ TEST(thp_handshake, full_handshake_self_test)
 }
 
 // ---------------------------------------------------------------------------
+// Paired-device recognition: a session N+1 with a fresh ephemeral must
+// still match the unmasked-static stored from session N. Earlier we stored
+// the masked form, which rotates per session and so could never re-match —
+// the user was forced to re-pair every connect.
+// ---------------------------------------------------------------------------
+TEST(thp_handshake, paired_device_recognised_across_sessions)
+{
+  // Session 1: simulate a Trezor we've previously paired with.  Capture
+  // its (unmasked) static pubkey and the host_static keypair we used.
+  TrezorSide trezor;
+  crypto::x25519_keypair(trezor.static_pub, trezor.static_priv);
+  trezor.device_properties = {0x0a, 0x04, 'T','S','7','x'};
+
+  HostStaticKey host_static;
+  crypto::x25519_keypair(host_static.pub, host_static.priv);
+
+  // Session 2: brand new initiator.  We feed it a KnownDevice whose
+  // trezor_static_pubkey is the unmasked one from the (simulated)
+  // ThpCredentialResponse.  The Trezor side will generate a fresh
+  // ephemeral, so the *masked* form on the wire is different from what
+  // session 1 saw — but the lookup must still succeed because we store
+  // the unmasked pubkey and recompute the mask per session.
+  KnownDevice kd;
+  kd.trezor_static_pubkey   = trezor.static_pub;
+  kd.host_static            = host_static;
+  kd.pairing_credential     = {0xDE, 0xAD, 0xBE, 0xEF};
+
+  NoiseXxInitiator host;
+  host.set_device_properties(trezor.device_properties.data(),
+                             trezor.device_properties.size());
+  host.set_host_static_key(host_static);
+  host.set_known_devices({kd});
+
+  auto init_req = host.build_init_request(/*try_to_unlock=*/false);
+  trezor.handle_init_request(init_req);
+  host.consume_init_response(trezor.handshake_init_response.data(),
+                             trezor.handshake_init_response.size());
+
+  // The whole point of B2: the recompute-on-lookup must succeed even
+  // though the masked form on the wire is novel.
+  EXPECT_TRUE(host.is_known_device());
+}
+
+// ---------------------------------------------------------------------------
+// Same lookup MUST NOT match a non-paired device — i.e. an attacker can't
+// trick the host into thinking a fresh device is "known" by guessing.
+// ---------------------------------------------------------------------------
+TEST(thp_handshake, paired_lookup_rejects_unrelated_device)
+{
+  TrezorSide trezor;
+  crypto::x25519_keypair(trezor.static_pub, trezor.static_priv);
+  trezor.device_properties = {0x0a, 0x04, 'T','S','7','x'};
+
+  // Known-device list contains some OTHER device's static pubkey.
+  HostStaticKey host_static;
+  crypto::x25519_keypair(host_static.pub, host_static.priv);
+  HostStaticKey other_host;
+  crypto::x25519_keypair(other_host.pub, other_host.priv);
+  NoisePubKey other_static{}; NoisePrivKey other_priv{};
+  crypto::x25519_keypair(other_static, other_priv);
+
+  KnownDevice kd;
+  kd.trezor_static_pubkey   = other_static;          // not `trezor.static_pub`
+  kd.host_static            = other_host;
+  kd.pairing_credential     = {0x01, 0x02, 0x03};
+
+  NoiseXxInitiator host;
+  host.set_device_properties(trezor.device_properties.data(),
+                             trezor.device_properties.size());
+  host.set_host_static_key(host_static);
+  host.set_known_devices({kd});
+
+  auto init_req = host.build_init_request(/*try_to_unlock=*/false);
+  trezor.handle_init_request(init_req);
+  host.consume_init_response(trezor.handshake_init_response.data(),
+                             trezor.handshake_init_response.size());
+
+  EXPECT_FALSE(host.is_known_device());
+}
+
+// ---------------------------------------------------------------------------
 // TransportCipher: round-trip seal / open with non-zero counters.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -812,6 +917,83 @@ TEST(thp_pairing, code_entry_wrong_code_fails_closed)
   // happy path, we also confirm consume_secret would have rejected
   // a mismatched secret.)
   EXPECT_FALSE(host.is_paired());
+}
+
+// ---------------------------------------------------------------------------
+// Code zero-padding: the spec requires the entered code to be hashed as
+// exactly 6 ASCII digits, zero-padded on the left. The user types
+// "942" but the Trezor displayed "000942" and hashed those 6 bytes —
+// without padding the host computes a different CPace generator and the
+// device rejects the host_tag. This test runs the full happy path with
+// a code that genuinely needs padding (we brute-force a handshake_hash
+// that yields a leading-zero code, then have the user type the
+// leading-zero-stripped form) — this would silently fail before B3.
+// ---------------------------------------------------------------------------
+TEST(thp_pairing, code_entry_zero_padded_code_works)
+{
+  // Find a handshake_hash that produces a code with at least one
+  // leading zero (i.e. code_int < 100000). The simulator's code is
+  // derived from a SHA-256 over (0x02 || h || secret || challenge), so
+  // varying h is enough — every ~10 attempts will yield a leading zero.
+  NoiseHash h{};
+  SimulatedTrezor trezor;
+  std::vector<uint8_t> cmt_raw, cpace_t_pub_raw, challenge_pb;
+  CodeEntryPairing *hostp = nullptr;
+
+  for (uint32_t seed = 0; seed < 256; ++seed) {
+    h = NoiseHash{};
+    for (size_t i = 0; i < h.size(); ++i) h[i] = uint8_t((seed * 7 + i) & 0xff);
+    trezor = SimulatedTrezor{};
+    trezor.set_handshake_hash(h);
+    delete hostp;
+    hostp = new CodeEntryPairing(h);
+    cmt_raw = trezor.step_select_method();
+    challenge_pb = hostp->consume_commitment_build_challenge(cmt_raw.data(), cmt_raw.size());
+    cpace_t_pub_raw = trezor.step_after_challenge(challenge_pb.data() + 2, 16);
+    if (trezor.code_int < 100000) break;
+  }
+  ASSERT_TRUE(hostp != nullptr);
+  ASSERT_LT(trezor.code_int, 100000u) << "failed to find a leading-zero code";
+
+  hostp->consume_cpace_trezor(cpace_t_pub_raw.data(), cpace_t_pub_raw.size());
+
+  // User types the code WITHOUT the leading zero(s). Host must pad to
+  // 6 digits internally before hashing.
+  std::string unpadded = std::to_string(trezor.code_int);
+  ASSERT_LT(unpadded.size(), 6u);
+
+  auto host_tag_pb = hostp->build_host_tag(unpadded);
+  ASSERT_GE(host_tag_pb.size(), 2u + 32 + 2 + 32);
+  const uint8_t *host_pub = host_tag_pb.data() + 2;
+  const uint8_t *host_tag = host_tag_pb.data() + 36;
+
+  // The Trezor (which hashed the 6-digit padded form) accepts the tag.
+  auto secret_raw = trezor.step_consume_host_tag(host_pub, host_tag);
+  EXPECT_TRUE(hostp->consume_secret(secret_raw.data(), secret_raw.size()));
+  EXPECT_TRUE(hostp->is_paired());
+  delete hostp;
+}
+
+// Reject obviously-malformed codes early instead of letting them flow
+// into the CPace derivation.
+TEST(thp_pairing, code_entry_rejects_malformed_codes)
+{
+  NoiseHash h{};
+  CodeEntryPairing host(h);
+  // Skip the FSM up to the point where build_host_tag can run by
+  // priming consume_cpace_trezor with a benign 32-byte value.
+  std::array<uint8_t, 32> dummy_pub{};
+  // We need consume_commitment first to satisfy the FSM precondition.
+  std::array<uint8_t, 32> dummy_commit{};
+  host.consume_commitment_build_challenge(dummy_commit.data(), dummy_commit.size());
+  host.consume_cpace_trezor(dummy_pub.data(), dummy_pub.size());
+
+  // 7-digit code → too long.
+  EXPECT_THROW(host.build_host_tag("1234567"), std::exception);
+  // Non-digits → reject.
+  EXPECT_THROW(host.build_host_tag("12a456"),  std::exception);
+  // Empty → reject.
+  EXPECT_THROW(host.build_host_tag(""),        std::exception);
 }
 
 TEST(thp_transport_cipher, seal_open_round_trip)
