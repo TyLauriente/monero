@@ -1229,13 +1229,16 @@ namespace trezor{
 #endif  // WITH_DEVICE_TREZOR_WEBUSB
 
   void enumerate(t_transport_vect & res){
-    BridgeTransport bt;
-    try{
-      bt.enumerate(res);
-    } catch (const std::exception & e){
-      MERROR("BridgeTransport enumeration failed:" << e.what());
-    }
-
+    // Probe direct USB transports first (WebUSB/libusb, then UDP for the
+    // emulator in debug builds). Trezor Bridge (trezord-go) is the legacy
+    // local-HTTP-proxy path; Trezor has deprecated the standalone Bridge
+    // installer in favour of the integrated Bridge built into Trezor
+    // Suite (nodeBridge), so the typical modern user does not have a
+    // local trezord-go daemon running. We keep the probe as a final
+    // fallback for users on legacy setups (e.g. Linux without udev rules
+    // where libusb can't reach the device, or anyone deliberately
+    // running standalone trezord-go) but it is no longer the preferred
+    // entry point.
 #ifdef WITH_DEVICE_TREZOR_WEBUSB
     hw::trezor::WebUsbTransport btw;
     try{
@@ -1253,6 +1256,21 @@ namespace trezor{
       MERROR("UdpTransport enumeration failed:" << e.what());
     }
 #endif
+
+    // Bridge tried last. On a modern install the standalone Bridge is
+    // not present (Trezor's recommended path is the integrated nodeBridge
+    // in Trezor Suite) and this probe simply fails — we log at WARNING
+    // rather than ERROR because the failure isn't actionable for the
+    // typical user; the direct-USB probes above are the modern path
+    // and have already populated `res` when libusb can see the device.
+    BridgeTransport bt;
+    try{
+      bt.enumerate(res);
+    } catch (const std::exception & e){
+      MWARNING("BridgeTransport enumeration failed (standalone Trezor "
+               "Bridge is deprecated by Trezor; ignore unless you "
+               "specifically rely on it): " << e.what());
+    }
   }
 
   void sort_transports_by_env(t_transport_vect & res){
